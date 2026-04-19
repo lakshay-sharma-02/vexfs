@@ -7,7 +7,7 @@ fn main() {
     let mountpoint = env::args().nth(1).expect("Usage: vexfs <mountpoint>");
     let fs = VexFS::new();
     fuser::mount2(fs, mountpoint, &[
-        MountOption::RO,
+        MountOption::RW,
         MountOption::FSName("vexfs".to_string()),
     ]).unwrap();
 }
