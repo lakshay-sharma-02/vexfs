@@ -1,0 +1,1 @@
+//! ARC cache — adaptive replacement, single unified pool
