@@ -243,3 +243,5 @@ impl DiskManager {
             .count()
     }
 }
+
+pub mod snapshot;
