@@ -1,4 +1,4 @@
-//! Core filesystem structures
+//! Core filesystem structures — superblock, inodes, disk manager
 
 pub mod btree;
 
@@ -10,7 +10,8 @@ pub const BLOCK_SIZE: usize = 4096;
 pub const MAX_FILES: usize = 1024;
 pub const SUPERBLOCK_OFFSET: u64 = 0;
 pub const INODE_TABLE_OFFSET: u64 = 4096;
-pub const DATA_OFFSET: u64 = 4096 + (MAX_FILES as u64 * 256);
+pub const INODE_SIZE: usize = 256;
+pub const DATA_OFFSET: u64 = 4096 + (MAX_FILES as u64 * INODE_SIZE as u64);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +22,9 @@ pub struct Superblock {
     pub total_blocks: u64,
     pub free_blocks: u64,
     pub inode_count: u64,
+    pub next_data_offset: u64,  // tracked on disk now
     pub created_at: u64,
+    _pad: [u8; 16],
 }
 
 impl Superblock {
@@ -33,7 +36,9 @@ impl Superblock {
             total_blocks,
             free_blocks: total_blocks,
             inode_count: 0,
+            next_data_offset: DATA_OFFSET,
             created_at: 0,
+            _pad: [0u8; 16],
         }
     }
 
@@ -42,40 +47,66 @@ impl Superblock {
     }
 }
 
+/// On-disk inode — exactly 256 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DiskInode {
-    pub ino: u64,
-    pub size: u64,
-    pub data_offset: u64,
-    pub created_at: u64,
-    pub modified_at: u64,
-    pub is_used: u8,
-    pub is_dir: u8,
-    pub name: [u8; 224],
-}
+    pub ino: u64,           // 8
+    pub size: u64,          // 8
+    pub data_offset: u64,   // 8 — where file data lives on disk
+    pub created_at: u64,    // 8
+    pub modified_at: u64,   // 8
+    pub is_used: u8,        // 1
+    pub is_dir: u8,         // 1
+    _pad: [u8; 6],          // 6 — align to 8 bytes
+    pub name: [u8; 208],    // 208 — filename
+}                           // total: 256 bytes
 
 impl DiskInode {
     pub fn empty() -> Self {
         Self {
-            ino: 0, size: 0, data_offset: 0,
-            created_at: 0, modified_at: 0,
-            is_used: 0, is_dir: 0, name: [0u8; 224],
+            ino: 0,
+            size: 0,
+            data_offset: 0,
+            created_at: 0,
+            modified_at: 0,
+            is_used: 0,
+            is_dir: 0,
+            _pad: [0u8; 6],
+            name: [0u8; 208],
         }
     }
 
+    pub fn is_valid(&self) -> bool {
+        if self.is_used == 0 { return false; }
+        // Name must start with a valid ASCII char
+        let first = self.name[0];
+        if first == 0 { return false; }
+        if !first.is_ascii_graphic() { return false; }
+        true
+    }
+
     pub fn get_name(&self) -> String {
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(224);
-        String::from_utf8_lossy(&self.name[..end]).to_string()
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(208);
+        let s = String::from_utf8_lossy(&self.name[..end]).to_string();
+        // Validate name — only printable ASCII
+        if s.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || "._- ".contains(c))) {
+            s
+        } else {
+            String::new() // corrupted — return empty
+        }
     }
 
     pub fn set_name(&mut self, name: &str) {
+        self.name = [0u8; 208];
         let bytes = name.as_bytes();
-        let len = bytes.len().min(223);
+        let len = bytes.len().min(207);
         self.name[..len].copy_from_slice(&bytes[..len]);
-        self.name[len] = 0;
     }
 }
+
+// Verify size at compile time
+const _: () = assert!(std::mem::size_of::<DiskInode>() == 256);
 
 pub struct DiskManager {
     file: File,
@@ -86,26 +117,30 @@ impl DiskManager {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let superblock = Self::read_superblock(&mut file)?;
+        if !superblock.is_valid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid VexFS magic — format the disk first"
+            ));
+        }
         Ok(Self { file, superblock })
     }
 
     pub fn format(path: &str, size_bytes: u64) -> std::io::Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true).write(true).open(path)?;
+
         let total_blocks = size_bytes / BLOCK_SIZE as u64;
         let superblock = Superblock::new(total_blocks);
+
         Self::write_superblock_to(&mut file, &superblock)?;
+
+        // Zero out entire inode table
         file.seek(SeekFrom::Start(INODE_TABLE_OFFSET))?;
-        let empty_inode = DiskInode::empty();
-        for _ in 0..MAX_FILES {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &empty_inode as *const DiskInode as *const u8,
-                    std::mem::size_of::<DiskInode>(),
-                )
-            };
-            file.write_all(bytes)?;
-        }
+        let zeroes = vec![0u8; MAX_FILES * INODE_SIZE];
+        file.write_all(&zeroes)?;
         file.flush()?;
+
         Ok(Self { file, superblock })
     }
 
@@ -133,23 +168,37 @@ impl DiskManager {
     }
 
     pub fn write_inode(&mut self, index: usize, inode: &DiskInode) -> std::io::Result<()> {
-        let offset = INODE_TABLE_OFFSET + (index * std::mem::size_of::<DiskInode>()) as u64;
+        assert!(index < MAX_FILES, "inode index out of bounds");
+        let offset = INODE_TABLE_OFFSET + (index * INODE_SIZE) as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 inode as *const DiskInode as *const u8,
-                std::mem::size_of::<DiskInode>(),
+                INODE_SIZE,
             )
         };
         self.file.write_all(bytes)
     }
 
     pub fn read_inode(&mut self, index: usize) -> std::io::Result<DiskInode> {
-        let offset = INODE_TABLE_OFFSET + (index * std::mem::size_of::<DiskInode>()) as u64;
+        assert!(index < MAX_FILES, "inode index out of bounds");
+        let offset = INODE_TABLE_OFFSET + (index * INODE_SIZE) as u64;
         self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; std::mem::size_of::<DiskInode>()];
+        let mut buf = [0u8; INODE_SIZE];
         self.file.read_exact(&mut buf)?;
         Ok(unsafe { *(buf.as_ptr() as *const DiskInode) })
+    }
+
+    /// Allocate space for file data — returns offset where data should be written
+    pub fn alloc_data(&mut self, size: usize) -> u64 {
+        let offset = self.superblock.next_data_offset;
+        self.superblock.next_data_offset += size as u64;
+        // Align to 512 bytes
+        let remainder = self.superblock.next_data_offset % 512;
+        if remainder != 0 {
+            self.superblock.next_data_offset += 512 - remainder;
+        }
+        offset
     }
 
     pub fn write_file_data(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -158,6 +207,7 @@ impl DiskManager {
     }
 
     pub fn read_file_data(&mut self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
+        if size == 0 { return Ok(vec![]); }
         self.file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; size];
         self.file.read_exact(&mut buf)?;
@@ -165,6 +215,31 @@ impl DiskManager {
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
+        // Always persist superblock (has next_data_offset)
+        let _ = self.write_superblock();
         self.file.flush()
+    }
+
+    /// Find a free inode slot
+    pub fn find_free_slot(&mut self) -> Option<usize> {
+        for i in 0..MAX_FILES {
+            if let Ok(inode) = self.read_inode(i) {
+                if inode.is_used == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Count used inodes
+    pub fn used_inodes(&mut self) -> usize {
+        (0..MAX_FILES)
+            .filter(|&i| {
+                self.read_inode(i)
+                    .map(|n| n.is_used == 1 && n.is_valid())
+                    .unwrap_or(false)
+            })
+            .count()
     }
 }

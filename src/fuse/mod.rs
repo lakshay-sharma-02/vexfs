@@ -1,4 +1,4 @@
-//! FUSE layer — VexFS with live AI + semantic search
+//! FUSE layer — VexFS with fixed inode allocator
 
 use fuser::{
     FileAttr, FileType, Filesystem,
@@ -32,7 +32,6 @@ pub struct VexFS {
     index: BPlusTree,
     files: HashMap<u64, VexFile>,
     next_inode: u64,
-    next_data_offset: u64,
     disk: DiskManager,
     log: AccessLog,
     markov: MarkovPrefetcher,
@@ -47,7 +46,6 @@ impl VexFS {
             index: BPlusTree::new(),
             files: HashMap::new(),
             next_inode: 2,
-            next_data_offset: DATA_OFFSET,
             disk,
             log: AccessLog::new(10_000),
             markov: MarkovPrefetcher::new(50_000),
@@ -62,14 +60,16 @@ impl VexFS {
         let mut files = HashMap::new();
         let mut search = SearchIndex::new();
         let mut next_inode = 2u64;
-        let mut next_data_offset = DATA_OFFSET;
 
         for i in 0..1024 {
             let inode = match disk.read_inode(i) {
                 Ok(n) => n,
                 Err(_) => break,
             };
-            if inode.is_used == 0 { continue; }
+            if !inode.is_valid() { continue; }
+
+            let name = inode.get_name();
+            if name.is_empty() { continue; }
 
             let data = if inode.size > 0 {
                 disk.read_file_data(inode.data_offset, inode.size as usize)
@@ -78,12 +78,8 @@ impl VexFS {
                 vec![]
             };
 
-            let name = inode.get_name();
             let attr = Self::make_attr(inode.ino, inode.size, inode.is_dir == 1);
-
-            // Index content for search on load
             search.index(inode.ino, &name, &data, inode.modified_at);
-
             index.insert(&name, BTreeValue {
                 ino: inode.ino,
                 size: inode.size,
@@ -100,20 +96,15 @@ impl VexFS {
                 open_since: None,
             });
 
-            if inode.ino >= next_inode { next_inode = inode.ino + 1; }
-            if inode.data_offset + inode.size > next_data_offset {
-                next_data_offset = inode.data_offset + inode.size;
+            if inode.ino >= next_inode {
+                next_inode = inode.ino + 1;
             }
         }
 
         println!("VexFS: loaded {} files (B+ tree + AI + search online)", index.len());
 
         Self {
-            index,
-            files,
-            next_inode,
-            next_data_offset,
-            disk,
+            index, files, next_inode, disk,
             log: AccessLog::new(10_000),
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
@@ -156,15 +147,6 @@ impl VexFS {
             .as_secs()
     }
 
-    fn find_free_slot(&mut self) -> Option<usize> {
-        for i in 0..1024 {
-            if let Ok(inode) = self.disk.read_inode(i) {
-                if inode.is_used == 0 { return Some(i); }
-            }
-        }
-        None
-    }
-
     fn flush_file(&mut self, ino: u64) {
         let (name, data, disk_index) = match self.files.get_mut(&ino) {
             Some(f) if f.dirty => {
@@ -174,10 +156,17 @@ impl VexFS {
             _ => return,
         };
 
+        // Allocate fresh space for this version of the file
+        let data_offset = if !data.is_empty() {
+            self.disk.alloc_data(data.len())
+        } else {
+            DATA_OFFSET
+        };
+
         let mut disk_inode = DiskInode::empty();
         disk_inode.ino = ino;
         disk_inode.size = data.len() as u64;
-        disk_inode.data_offset = self.next_data_offset;
+        disk_inode.data_offset = data_offset;
         disk_inode.is_used = 1;
         disk_inode.is_dir = 0;
         disk_inode.created_at = Self::now_secs();
@@ -185,8 +174,7 @@ impl VexFS {
         disk_inode.set_name(&name);
 
         if !data.is_empty() {
-            let _ = self.disk.write_file_data(self.next_data_offset, &data);
-            self.next_data_offset += data.len() as u64;
+            let _ = self.disk.write_file_data(data_offset, &data);
         }
 
         let _ = self.disk.write_inode(disk_index, &disk_inode);
@@ -231,29 +219,11 @@ impl VexFS {
         }
     }
 
-    /// Public search — called by CLI tool
     pub fn search(&self, query: &str) -> Vec<(String, f32, Vec<String>)> {
         self.search.search(query)
             .into_iter()
             .map(|r| (r.name, r.score, r.matched_terms))
             .collect()
-    }
-
-    pub fn ai_status(&self) {
-        println!("\n=== VexFS AI Status ===");
-        println!("Events logged:   {}", self.log.len());
-        println!("Markov entries:  {}", self.markov.entry_count());
-        println!("Search indexed:  {}", self.search.indexed_count());
-
-        let ranked = self.importance.ranked_files();
-        if !ranked.is_empty() {
-            println!("\nTop files:");
-            for f in ranked.iter().take(5) {
-                println!("  [{}] {} score={:.2} accessed={}x",
-                    f.tier.label(), f.name, f.score, f.access_count);
-            }
-        }
-        println!("=======================\n");
     }
 }
 
@@ -325,7 +295,7 @@ impl Filesystem for VexFS {
     fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         if parent != 1 { reply.error(ENOENT); return; }
 
-        let slot = match self.find_free_slot() {
+        let slot = match self.disk.find_free_slot() {
             Some(s) => s,
             None => { reply.error(ENOSPC); return; }
         };
@@ -357,7 +327,6 @@ impl Filesystem for VexFS {
             open_since: Some(Self::now_secs()),
         });
 
-        // Index empty file for search
         self.search.index(ino, &name_str, &[], Self::now_secs());
         self.log.record(AccessEvent::now(ino, &name_str, AccessKind::Open, 0));
         self.importance.record_access(ino, &name_str, 0);
@@ -387,7 +356,6 @@ impl Filesystem for VexFS {
             return;
         }
 
-        // Re-index content for search after write
         if let Some(file) = self.files.get(&ino) {
             self.search.index(ino, &name, &file.data.clone(), Self::now_secs());
         }
