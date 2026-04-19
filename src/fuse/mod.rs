@@ -1,5 +1,4 @@
-//! FUSE layer — VexFS with live AI subsystem
-//! Every file access feeds the logger, Markov chain, and importance scorer.
+//! FUSE layer — VexFS with live AI + semantic search
 
 use fuser::{
     FileAttr, FileType, Filesystem,
@@ -16,6 +15,7 @@ use crate::fs::btree::{BPlusTree, Value as BTreeValue};
 use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
 use crate::ai::markov::MarkovPrefetcher;
 use crate::ai::importance::ImportanceEngine;
+use crate::ai::search::SearchIndex;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -25,7 +25,7 @@ struct VexFile {
     attr: FileAttr,
     disk_index: usize,
     dirty: bool,
-    open_since: Option<u64>,  // when file was opened (for duration tracking)
+    open_since: Option<u64>,
 }
 
 pub struct VexFS {
@@ -34,12 +34,11 @@ pub struct VexFS {
     next_inode: u64,
     next_data_offset: u64,
     disk: DiskManager,
-
-    // AI subsystem — live, wired into every operation
     log: AccessLog,
     markov: MarkovPrefetcher,
     importance: ImportanceEngine,
-    last_opened_ino: Option<u64>,  // for Markov transitions
+    search: SearchIndex,
+    last_opened_ino: Option<u64>,
 }
 
 impl VexFS {
@@ -53,6 +52,7 @@ impl VexFS {
             log: AccessLog::new(10_000),
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
+            search: SearchIndex::new(),
             last_opened_ino: None,
         }
     }
@@ -60,6 +60,7 @@ impl VexFS {
     pub fn load(mut disk: DiskManager) -> Self {
         let mut index = BPlusTree::new();
         let mut files = HashMap::new();
+        let mut search = SearchIndex::new();
         let mut next_inode = 2u64;
         let mut next_data_offset = DATA_OFFSET;
 
@@ -79,6 +80,9 @@ impl VexFS {
 
             let name = inode.get_name();
             let attr = Self::make_attr(inode.ino, inode.size, inode.is_dir == 1);
+
+            // Index content for search on load
+            search.index(inode.ino, &name, &data, inode.modified_at);
 
             index.insert(&name, BTreeValue {
                 ino: inode.ino,
@@ -102,7 +106,7 @@ impl VexFS {
             }
         }
 
-        println!("VexFS: loaded {} files (B+ tree + AI online)", index.len());
+        println!("VexFS: loaded {} files (B+ tree + AI + search online)", index.len());
 
         Self {
             index,
@@ -113,27 +117,21 @@ impl VexFS {
             log: AccessLog::new(10_000),
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
+            search,
             last_opened_ino: None,
         }
     }
 
     fn make_attr(ino: u64, size: u64, is_dir: bool) -> FileAttr {
         FileAttr {
-            ino,
-            size,
+            ino, size,
             blocks: (size + 511) / 512,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
             kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
             perm: if is_dir { 0o755 } else { 0o644 },
-            nlink: 1,
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            blksize: 4096,
-            flags: 0,
+            nlink: 1, uid: 1000, gid: 1000,
+            rdev: 0, blksize: 4096, flags: 0,
         }
     }
 
@@ -195,45 +193,34 @@ impl VexFS {
         let _ = self.disk.flush();
     }
 
-    /// Called on every file open — feeds AI subsystem
     fn ai_on_open(&mut self, ino: u64, name: &str, size: u64) {
-        // 1. Log the access
         self.log.record(AccessEvent::now(ino, name, AccessKind::Open, size));
 
-        // 2. Record Markov transition from last opened file
-        if let Some(prev_ino) = self.last_opened_ino {
-            if prev_ino != ino {
-                self.markov.record_transition(prev_ino, ino, name);
+        if let Some(prev) = self.last_opened_ino {
+            if prev != ino {
+                self.markov.record_transition(prev, ino, name);
             }
         }
         self.last_opened_ino = Some(ino);
-
-        // 3. Record importance
         self.importance.record_access(ino, name, 0);
 
-        // 4. Show prediction (in real OS this triggers prefetch)
         if let Some((pred_ino, pred_name, prob)) = self.markov.top_prediction(ino) {
             let tier = self.importance.tier(pred_ino);
             println!(
-                "VexFS AI: opened '{}' → predicting '{}' next ({:.0}% confidence) [{}]",
+                "VexFS AI: '{}' → predicting '{}' next ({:.0}%) [{}]",
                 name, pred_name, prob * 100.0, tier.label()
             );
         }
 
-        // 5. Show importance tier
         let tier = self.importance.tier(ino);
         let score = self.importance.score(ino);
-        println!(
-            "VexFS AI: '{}' importance={:.2} tier={}",
-            name, score, tier.label()
-        );
+        println!("VexFS AI: '{}' score={:.2} [{}]", name, score, tier.label());
     }
 
-    /// Called on file close — records how long it was open
     fn ai_on_close(&mut self, ino: u64, name: &str) {
         let duration = self.files.get(&ino)
             .and_then(|f| f.open_since)
-            .map(|open_at| Self::now_secs().saturating_sub(open_at))
+            .map(|t| Self::now_secs().saturating_sub(t))
             .unwrap_or(0);
 
         self.log.record(AccessEvent::now(ino, name, AccessKind::Close, 0));
@@ -244,66 +231,29 @@ impl VexFS {
         }
     }
 
-    /// Semantic-style search — by time, content hints, importance
-    pub fn search(&self, query: &str) -> Vec<(String, f32)> {
-        let query = query.to_lowercase();
-        let mut results = vec![];
-
-        let all_files = self.index.list_all();
-
-        for (key, val) in &all_files {
-            let name = key.0.to_lowercase();
-            let score = self.importance.score(val.ino);
-            let last = self.log.last_access(val.ino).unwrap_or(0);
-            let now = Self::now_secs();
-            let age = now.saturating_sub(last);
-
-            let mut relevance = 0.0f32;
-
-            // Time-based queries
-            if query.contains("yesterday") {
-                if age >= 86400 && age < 172800 { relevance += 0.8; }
-            }
-            if query.contains("today") || query.contains("recent") {
-                if age < 86400 { relevance += 0.8; }
-            }
-            if query.contains("old") || query.contains("archive") {
-                if age > 7 * 86400 { relevance += 0.5; }
-            }
-
-            // Name-based matching
-            for word in query.split_whitespace() {
-                if name.contains(word) { relevance += 0.6; }
-            }
-
-            // Boost by importance score
-            relevance += score * 0.3;
-
-            if relevance > 0.1 {
-                results.push((key.0.clone(), relevance));
-            }
-        }
-
-        // Sort by relevance
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        results
+    /// Public search — called by CLI tool
+    pub fn search(&self, query: &str) -> Vec<(String, f32, Vec<String>)> {
+        self.search.search(query)
+            .into_iter()
+            .map(|r| (r.name, r.score, r.matched_terms))
+            .collect()
     }
 
-    /// Print AI status — what the system knows right now
     pub fn ai_status(&self) {
         println!("\n=== VexFS AI Status ===");
-        println!("Access log: {} events", self.log.len());
-        println!("Markov table: {} transitions", self.markov.entry_count());
+        println!("Events logged:   {}", self.log.len());
+        println!("Markov entries:  {}", self.markov.entry_count());
+        println!("Search indexed:  {}", self.search.indexed_count());
 
         let ranked = self.importance.ranked_files();
         if !ranked.is_empty() {
-            println!("\nTop files by importance:");
+            println!("\nTop files:");
             for f in ranked.iter().take(5) {
-                println!("  {} — score={:.2} accessed={} times [{}]",
-                    f.name, f.score, f.access_count, f.tier.label());
+                println!("  [{}] {} score={:.2} accessed={}x",
+                    f.tier.label(), f.name, f.score, f.access_count);
             }
         }
-        println!("======================\n");
+        println!("=======================\n");
     }
 }
 
@@ -316,10 +266,8 @@ impl Filesystem for VexFS {
             let ino = btval.ino;
             let size = btval.size;
             if let Some(file) = self.files.get_mut(&ino) {
-                // Mark open time
                 file.open_since = Some(Self::now_secs());
                 let attr = file.attr;
-                // Feed AI
                 self.ai_on_open(ino, &name_str, size);
                 reply.entry(&TTL, &attr, 0);
                 return;
@@ -339,11 +287,9 @@ impl Filesystem for VexFS {
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
         if let Some(file) = self.files.get(&ino) {
-            // Log read event
             let name = file.name.clone();
             let fsize = file.attr.size;
             self.log.record(AccessEvent::now(ino, &name, AccessKind::Read, fsize));
-
             let start = offset as usize;
             let end = (start + size as usize).min(file.data.len());
             if start < file.data.len() {
@@ -365,17 +311,13 @@ impl Filesystem for VexFS {
         ];
 
         for (key, val) in self.index.list_all() {
-            entries.push((val.ino, if val.is_dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            }, key.0.clone()));
+            entries.push((val.ino,
+                if val.is_dir { FileType::Directory } else { FileType::RegularFile },
+                key.0.clone()));
         }
 
         for (i, (ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*ino, (i + 1) as i64, *kind, name.as_str()) {
-                break;
-            }
+            if reply.add(*ino, (i + 1) as i64, *kind, name.as_str()) { break; }
         }
         reply.ok();
     }
@@ -415,11 +357,11 @@ impl Filesystem for VexFS {
             open_since: Some(Self::now_secs()),
         });
 
-        // Log creation
+        // Index empty file for search
+        self.search.index(ino, &name_str, &[], Self::now_secs());
         self.log.record(AccessEvent::now(ino, &name_str, AccessKind::Open, 0));
         self.importance.record_access(ino, &name_str, 0);
-
-        println!("VexFS AI: created '{}' inode={}", name_str, ino);
+        println!("VexFS AI: created '{}'", name_str);
 
         self.flush_file(ino);
         reply.created(&TTL, &attr, 0, ino, 0);
@@ -445,24 +387,20 @@ impl Filesystem for VexFS {
             return;
         }
 
-        // Log write
-        self.log.record(AccessEvent::now(ino, &name, AccessKind::Write, data.len() as u64));
+        // Re-index content for search after write
+        if let Some(file) = self.files.get(&ino) {
+            self.search.index(ino, &name, &file.data.clone(), Self::now_secs());
+        }
 
+        self.log.record(AccessEvent::now(ino, &name, AccessKind::Write, data.len() as u64));
         let written = data.len() as u32;
         self.flush_file(ino);
         reply.written(written);
     }
 
     fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        // Called when file is closed — record duration
-        let name = self.files.get(&ino)
-            .map(|f| f.name.clone())
-            .unwrap_or_default();
-
-        if !name.is_empty() {
-            self.ai_on_close(ino, &name);
-        }
-
+        let name = self.files.get(&ino).map(|f| f.name.clone()).unwrap_or_default();
+        if !name.is_empty() { self.ai_on_close(ino, &name); }
         reply.ok();
     }
 
@@ -471,16 +409,13 @@ impl Filesystem for VexFS {
         let name_str = name.to_string_lossy().to_string();
 
         if let Some(btval) = self.index.remove(&name_str) {
-            // Log deletion
-            self.log.record(AccessEvent::now(
-                btval.ino, &name_str, AccessKind::Delete, 0
-            ));
-            println!("VexFS AI: deleted '{}'", name_str);
-
+            self.search.remove(btval.ino);
+            self.log.record(AccessEvent::now(btval.ino, &name_str, AccessKind::Delete, 0));
             self.files.remove(&btval.ino);
             let empty = DiskInode::empty();
             let _ = self.disk.write_inode(btval.disk_index, &empty);
             let _ = self.disk.flush();
+            println!("VexFS AI: deleted '{}'", name_str);
             reply.ok();
         } else {
             reply.error(ENOENT);
