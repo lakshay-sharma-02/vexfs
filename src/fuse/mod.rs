@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::fs::{DiskManager, DiskInode, DATA_OFFSET};
 use crate::fs::btree::{BPlusTree, Value as BTreeValue};
 use crate::fs::snapshot::SnapshotManager;
+use crate::fs::snapshot_disk::{DiskSnapshot, SNAPSHOT_MAGIC};
 use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
 use crate::ai::markov::MarkovPrefetcher;
 use crate::ai::importance::ImportanceEngine;
@@ -104,7 +105,49 @@ impl VexFS {
             }
         }
 
-        println!("VexFS: loaded {} files (B+ tree + AI + search + snapshots)", index.len());
+        // Load snapshots from disk
+        let mut snapshots = SnapshotManager::new(10);
+        let mut snap_count = 0;
+        for i in 0..256 {
+            let disk_snap = match disk.read_snapshot(i) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if !disk_snap.is_valid() { continue; }
+            let name = disk_snap.get_name();
+            if name.is_empty() { continue; }
+
+            let data = if disk_snap.size > 0 {
+                disk.read_file_data(disk_snap.data_offset, disk_snap.size as usize)
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
+            snapshots.snapshots
+                .entry(disk_snap.ino)
+                .or_default()
+                .push(crate::fs::snapshot::Snapshot {
+                    id: disk_snap.id,
+                    ino: disk_snap.ino,
+                    name: name.clone(),
+                    size: disk_snap.size,
+                    data_offset: disk_snap.data_offset,
+                    timestamp: disk_snap.timestamp,
+                    data,
+                });
+            snap_count += 1;
+        }
+        if snap_count > 0 {
+            snapshots.next_id = snapshots.snapshots.values()
+                .flat_map(|v| v.iter())
+                .map(|s| s.id)
+                .max()
+                .unwrap_or(0) + 1;
+        }
+
+        println!("VexFS: loaded {} files, {} snapshots (B+ tree + AI + search + snapshots)",
+            index.len(), snap_count);
 
         Self {
             index, files, next_inode, disk,
@@ -112,7 +155,7 @@ impl VexFS {
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
             search,
-            snapshots: SnapshotManager::new(10),
+            snapshots,
             last_opened_ino: None,
         }
     }
@@ -415,9 +458,35 @@ impl Filesystem for VexFS {
                     let snap_data = file.data.clone();
                     let snap_name = file.name.clone();
                     let snap_offset = file.attr.size;
+
+                    // 1. Record in memory
                     self.snapshots.snapshot(ino, &snap_name, &snap_data, snap_offset);
-                    println!("VexFS: 📸 snapshot of '{}' before truncate (total: {})",
-                        snap_name, self.snapshots.total_snapshots());
+                    let snap_id = self.snapshots.next_id - 1;
+
+                    // 2. Persist data to disk
+                    let data_offset = self.disk.alloc_data(snap_data.len());
+                    let _ = self.disk.write_file_data(data_offset, &snap_data);
+
+                    // 3. Write snapshot record to snapshot table
+                    if let Some(slot) = self.disk.find_free_snapshot_slot() {
+                        let mut disk_snap = DiskSnapshot::empty();
+                        disk_snap.magic = SNAPSHOT_MAGIC;
+                        disk_snap.id = snap_id;
+                        disk_snap.ino = ino;
+                        disk_snap.size = snap_data.len() as u64;
+                        disk_snap.data_offset = data_offset;
+                        disk_snap.timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        disk_snap.is_used = 1;
+                        disk_snap.set_name(&snap_name);
+                        let _ = self.disk.write_snapshot(slot, &disk_snap);
+                        let _ = self.disk.flush();
+                    }
+
+                    println!("VexFS: 📸 snapshot of '{}' persisted to disk (v{}, total: {})",
+                        snap_name, snap_id, self.snapshots.total_snapshots());
                 }
             }
             if let Some(file) = self.files.get_mut(&ino) {

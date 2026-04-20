@@ -1,6 +1,8 @@
 //! Core filesystem structures — superblock, inodes, disk manager
 
 pub mod btree;
+pub mod snapshot;
+pub mod snapshot_disk;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
@@ -11,7 +13,8 @@ pub const MAX_FILES: usize = 1024;
 pub const SUPERBLOCK_OFFSET: u64 = 0;
 pub const INODE_TABLE_OFFSET: u64 = 4096;
 pub const INODE_SIZE: usize = 256;
-pub const DATA_OFFSET: u64 = 4096 + (MAX_FILES as u64 * INODE_SIZE as u64);
+pub const SNAPSHOT_TABLE_SIZE: u64 = 256 * 512; // 256 slots * 512 bytes
+pub const DATA_OFFSET: u64 = 4096 + (MAX_FILES as u64 * INODE_SIZE as u64) + SNAPSHOT_TABLE_SIZE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +235,44 @@ impl DiskManager {
         None
     }
 
+    /// Write a snapshot record to disk
+    pub fn write_snapshot(&mut self, index: usize, snap: &snapshot_disk::DiskSnapshot) -> std::io::Result<()> {
+        assert!(index < snapshot_disk::MAX_SNAPSHOTS, "snapshot index out of bounds");
+        let offset = snapshot_disk::SNAPSHOT_TABLE_OFFSET
+            + (index * snapshot_disk::SNAPSHOT_RECORD_SIZE) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                snap as *const snapshot_disk::DiskSnapshot as *const u8,
+                snapshot_disk::SNAPSHOT_RECORD_SIZE,
+            )
+        };
+        self.file.write_all(bytes)
+    }
+
+    /// Read a snapshot record from disk
+    pub fn read_snapshot(&mut self, index: usize) -> std::io::Result<snapshot_disk::DiskSnapshot> {
+        assert!(index < snapshot_disk::MAX_SNAPSHOTS, "snapshot index out of bounds");
+        let offset = snapshot_disk::SNAPSHOT_TABLE_OFFSET
+            + (index * snapshot_disk::SNAPSHOT_RECORD_SIZE) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; snapshot_disk::SNAPSHOT_RECORD_SIZE];
+        self.file.read_exact(&mut buf)?;
+        Ok(unsafe { *(buf.as_ptr() as *const snapshot_disk::DiskSnapshot) })
+    }
+
+    /// Find a free snapshot slot
+    pub fn find_free_snapshot_slot(&mut self) -> Option<usize> {
+        for i in 0..snapshot_disk::MAX_SNAPSHOTS {
+            if let Ok(snap) = self.read_snapshot(i) {
+                if snap.is_used == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
     /// Count used inodes
     pub fn used_inodes(&mut self) -> usize {
         (0..MAX_FILES)
@@ -244,4 +285,4 @@ impl DiskManager {
     }
 }
 
-pub mod snapshot;
+
