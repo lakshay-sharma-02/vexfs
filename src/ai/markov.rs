@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// Transition table: after seeing file A, what comes next?
 pub struct MarkovPrefetcher {
     // ino -> Vec<(next_ino, next_name, count)>
-    transitions: HashMap<u64, Vec<(u64, String, u32)>>,
+    pub transitions: HashMap<u64, Vec<(u64, String, u32)>>,
     // total memory used (approximate)
     entry_count: usize,
     max_entries: usize,

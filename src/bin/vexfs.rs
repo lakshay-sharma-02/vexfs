@@ -17,7 +17,7 @@ fn main() {
     let disk = DiskManager::open(image).expect("Failed to open disk image");
 
     println!("VexFS: mounting {} at {}", image, mountpoint);
-    let fs = VexFS::load(disk);
+    let fs = VexFS::load(disk, image);
 
     fuser::mount2(fs, mountpoint, &[
         MountOption::RW,

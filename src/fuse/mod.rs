@@ -14,6 +14,7 @@ use crate::fs::{DiskManager, DiskInode, DATA_OFFSET};
 use crate::fs::btree::{BPlusTree, Value as BTreeValue};
 use crate::fs::snapshot::SnapshotManager;
 use crate::fs::buffer::WriteBuffer;
+use crate::ai::persist::AIPersistence;
 use crate::fs::snapshot_disk::{DiskSnapshot, SNAPSHOT_MAGIC};
 use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
 use crate::ai::markov::MarkovPrefetcher;
@@ -43,6 +44,7 @@ pub struct VexFS {
     snapshots: SnapshotManager,
     last_opened_ino: Option<u64>,
     write_buffer: WriteBuffer,
+    ai_persist: AIPersistence,
 }
 
 impl VexFS {
@@ -59,10 +61,11 @@ impl VexFS {
             snapshots: SnapshotManager::new(10),
             last_opened_ino: None,
             write_buffer: WriteBuffer::new(32, 5),
+            ai_persist: AIPersistence::new("vexfs.img"),
         }
     }
 
-    pub fn load(mut disk: DiskManager) -> Self {
+    pub fn load(mut disk: DiskManager, image_path: &str) -> Self {
         let mut index = BPlusTree::new();
         let mut files = HashMap::new();
         let mut search = SearchIndex::new();
@@ -152,15 +155,40 @@ impl VexFS {
         println!("VexFS: loaded {} files, {} snapshots (B+ tree + AI + search + snapshots)",
             index.len(), snap_count);
 
+        let ai_persist = AIPersistence::new(image_path);
+
+        // Load persisted AI state
+        let (saved_markov, saved_importance) = ai_persist.load().unwrap_or_default();
+        let mut markov = MarkovPrefetcher::new(50_000);
+        let mut importance = ImportanceEngine::new();
+
+        for (from_ino, transitions) in saved_markov {
+            for (to_ino, name, count) in transitions {
+                for _ in 0..count {
+                    markov.record_transition(from_ino, to_ino, &name);
+                }
+            }
+        }
+
+        for (ino, (name, access_count, last_access, total_secs)) in &saved_importance {
+            importance.stats.insert(*ino, (name.clone(), *access_count, *last_access, *total_secs));
+        }
+
+        if ai_persist.exists() {
+            println!("VexFS AI: restored {} Markov entries, {} file scores from disk",
+                markov.entry_count(), importance.stats.len());
+        }
+
         Self {
             index, files, next_inode, disk,
             log: AccessLog::new(10_000),
-            markov: MarkovPrefetcher::new(50_000),
-            importance: ImportanceEngine::new(),
+            markov,
+            importance,
             search,
             snapshots,
             last_opened_ino: None,
             write_buffer: WriteBuffer::new(32, 5),
+            ai_persist,
         }
     }
 
@@ -244,7 +272,7 @@ impl VexFS {
         let _ = self.disk.flush();
     }
 
-    /// Flush all buffered writes — call on unmount
+    /// Flush all buffered writes and save AI state — call on unmount
     pub fn flush_all(&mut self) {
         let all = self.write_buffer.take_all();
         let count = all.len();
@@ -254,6 +282,15 @@ impl VexFS {
         if count > 0 {
             println!("VexFS: flushed {} buffered writes to disk", count);
         }
+
+        // Save AI state to disk
+        let _ = self.ai_persist.save(
+            &self.markov.transitions,
+            &self.importance.stats,
+        );
+        println!("VexFS AI: state saved to disk ({} Markov entries, {} file scores)",
+            self.markov.entry_count(),
+            self.importance.stats.len());
     }
 
     fn ai_on_open(&mut self, ino: u64, name: &str, size: u64) {

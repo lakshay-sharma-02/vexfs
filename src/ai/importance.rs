@@ -46,7 +46,7 @@ impl FileScore {
 /// The importance engine
 pub struct ImportanceEngine {
     // ino -> (name, access_count, last_access_secs, total_open_secs)
-    stats: HashMap<u64, (String, u32, u64, u64)>,
+    pub stats: HashMap<u64, (String, u32, u64, u64)>,
 }
 
 impl ImportanceEngine {
