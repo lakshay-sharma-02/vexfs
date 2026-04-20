@@ -1,4 +1,4 @@
-//! FUSE layer — VexFS with fixed inode allocator
+//! FUSE layer — VexFS with live AI + semantic search + snapshots
 
 use fuser::{
     FileAttr, FileType, Filesystem,
@@ -12,6 +12,7 @@ use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::fs::{DiskManager, DiskInode, DATA_OFFSET};
 use crate::fs::btree::{BPlusTree, Value as BTreeValue};
+use crate::fs::snapshot::SnapshotManager;
 use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
 use crate::ai::markov::MarkovPrefetcher;
 use crate::ai::importance::ImportanceEngine;
@@ -37,6 +38,7 @@ pub struct VexFS {
     markov: MarkovPrefetcher,
     importance: ImportanceEngine,
     search: SearchIndex,
+    snapshots: SnapshotManager,
     last_opened_ino: Option<u64>,
 }
 
@@ -51,6 +53,7 @@ impl VexFS {
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
             search: SearchIndex::new(),
+            snapshots: SnapshotManager::new(10),
             last_opened_ino: None,
         }
     }
@@ -101,7 +104,7 @@ impl VexFS {
             }
         }
 
-        println!("VexFS: loaded {} files (B+ tree + AI + search online)", index.len());
+        println!("VexFS: loaded {} files (B+ tree + AI + search + snapshots)", index.len());
 
         Self {
             index, files, next_inode, disk,
@@ -109,6 +112,7 @@ impl VexFS {
             markov: MarkovPrefetcher::new(50_000),
             importance: ImportanceEngine::new(),
             search,
+            snapshots: SnapshotManager::new(10),
             last_opened_ino: None,
         }
     }
@@ -156,7 +160,6 @@ impl VexFS {
             _ => return,
         };
 
-        // Allocate fresh space for this version of the file
         let data_offset = if !data.is_empty() {
             self.disk.alloc_data(data.len())
         } else {
@@ -224,6 +227,25 @@ impl VexFS {
             .into_iter()
             .map(|r| (r.name, r.score, r.matched_terms))
             .collect()
+    }
+
+    pub fn ai_status(&self) {
+        println!("\n=== VexFS AI Status ===");
+        println!("Events logged:   {}", self.log.len());
+        println!("Markov entries:  {}", self.markov.entry_count());
+        println!("Search indexed:  {}", self.search.indexed_count());
+        println!("Snapshots total: {}", self.snapshots.total_snapshots());
+        println!("Files backed up: {}", self.snapshots.files_with_snapshots());
+
+        let ranked = self.importance.ranked_files();
+        if !ranked.is_empty() {
+            println!("\nTop files:");
+            for f in ranked.iter().take(5) {
+                println!("  [{}] {} score={:.2} accessed={}x",
+                    f.tier.label(), f.name, f.score, f.access_count);
+            }
+        }
+        println!("=======================\n");
     }
 }
 
@@ -343,6 +365,16 @@ impl Filesystem for VexFS {
         };
 
         if let Some(file) = self.files.get_mut(&ino) {
+            // Auto-snapshot before overwriting existing content
+            if !file.data.is_empty() {
+                let snap_data = file.data.clone();
+                let snap_name = file.name.clone();
+                let snap_offset = file.attr.size;
+                self.snapshots.snapshot(ino, &snap_name, &snap_data, snap_offset);
+                println!("VexFS: 📸 auto-snapshot of '{}' (v{})",
+                    snap_name, self.snapshots.total_snapshots());
+            }
+
             let offset = offset as usize;
             let end = offset + data.len();
             if end > file.data.len() { file.data.resize(end, 0); }
@@ -372,12 +404,44 @@ impl Filesystem for VexFS {
         reply.ok();
     }
 
+    fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<std::time::SystemTime>, _fh: Option<u64>, _crtime: Option<std::time::SystemTime>, _chgtime: Option<std::time::SystemTime>, _bkuptime: Option<std::time::SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+        if ino == 1 { reply.attr(&TTL, &Self::root_attr()); return; }
+
+        // Handle truncate — shell does this before writing to existing file
+        if let Some(new_size) = size {
+            // Snapshot BEFORE truncating — this preserves the old content
+            if let Some(file) = self.files.get(&ino) {
+                if !file.data.is_empty() && new_size < file.attr.size {
+                    let snap_data = file.data.clone();
+                    let snap_name = file.name.clone();
+                    let snap_offset = file.attr.size;
+                    self.snapshots.snapshot(ino, &snap_name, &snap_data, snap_offset);
+                    println!("VexFS: 📸 snapshot of '{}' before truncate (total: {})",
+                        snap_name, self.snapshots.total_snapshots());
+                }
+            }
+            if let Some(file) = self.files.get_mut(&ino) {
+                file.data.resize(new_size as usize, 0);
+                file.attr.size = new_size;
+                file.attr.blocks = (new_size + 511) / 512;
+                file.dirty = true;
+            }
+        }
+
+        if let Some(file) = self.files.get(&ino) {
+            reply.attr(&TTL, &file.attr);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if parent != 1 { reply.error(ENOENT); return; }
         let name_str = name.to_string_lossy().to_string();
 
         if let Some(btval) = self.index.remove(&name_str) {
             self.search.remove(btval.ino);
+            self.snapshots.remove_file(btval.ino);
             self.log.record(AccessEvent::now(btval.ino, &name_str, AccessKind::Delete, 0));
             self.files.remove(&btval.ino);
             let empty = DiskInode::empty();
