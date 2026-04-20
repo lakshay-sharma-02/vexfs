@@ -1,6 +1,7 @@
 //! Core filesystem structures — superblock, inodes, disk manager
 
 pub mod btree;
+pub mod buffer;
 pub mod snapshot;
 pub mod snapshot_disk;
 

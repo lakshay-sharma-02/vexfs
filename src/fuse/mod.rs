@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::fs::{DiskManager, DiskInode, DATA_OFFSET};
 use crate::fs::btree::{BPlusTree, Value as BTreeValue};
 use crate::fs::snapshot::SnapshotManager;
+use crate::fs::buffer::WriteBuffer;
 use crate::fs::snapshot_disk::{DiskSnapshot, SNAPSHOT_MAGIC};
 use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
 use crate::ai::markov::MarkovPrefetcher;
@@ -41,6 +42,7 @@ pub struct VexFS {
     search: SearchIndex,
     snapshots: SnapshotManager,
     last_opened_ino: Option<u64>,
+    write_buffer: WriteBuffer,
 }
 
 impl VexFS {
@@ -56,6 +58,7 @@ impl VexFS {
             search: SearchIndex::new(),
             snapshots: SnapshotManager::new(10),
             last_opened_ino: None,
+            write_buffer: WriteBuffer::new(32, 5),
         }
     }
 
@@ -157,6 +160,7 @@ impl VexFS {
             search,
             snapshots,
             last_opened_ino: None,
+            write_buffer: WriteBuffer::new(32, 5),
         }
     }
 
@@ -203,6 +207,19 @@ impl VexFS {
             _ => return,
         };
 
+        // Buffer the write — only flush to disk when buffer is due
+        self.write_buffer.write(ino, &name, data.clone(), disk_index);
+
+        // Check if any buffered writes are due for flushing
+        let due = self.write_buffer.due_for_flush();
+        for due_ino in due {
+            if let Some((buf_data, buf_idx, buf_name)) = self.write_buffer.take(due_ino) {
+                self.persist_to_disk(due_ino, &buf_name, &buf_data, buf_idx);
+            }
+        }
+    }
+
+    fn persist_to_disk(&mut self, ino: u64, name: &str, data: &[u8], disk_index: usize) {
         let data_offset = if !data.is_empty() {
             self.disk.alloc_data(data.len())
         } else {
@@ -217,14 +234,26 @@ impl VexFS {
         disk_inode.is_dir = 0;
         disk_inode.created_at = Self::now_secs();
         disk_inode.modified_at = Self::now_secs();
-        disk_inode.set_name(&name);
+        disk_inode.set_name(name);
 
         if !data.is_empty() {
-            let _ = self.disk.write_file_data(data_offset, &data);
+            let _ = self.disk.write_file_data(data_offset, data);
         }
 
         let _ = self.disk.write_inode(disk_index, &disk_inode);
         let _ = self.disk.flush();
+    }
+
+    /// Flush all buffered writes — call on unmount
+    pub fn flush_all(&mut self) {
+        let all = self.write_buffer.take_all();
+        let count = all.len();
+        for (ino, data, idx, name) in all {
+            self.persist_to_disk(ino, &name, &data, idx);
+        }
+        if count > 0 {
+            println!("VexFS: flushed {} buffered writes to disk", count);
+        }
     }
 
     fn ai_on_open(&mut self, ino: u64, name: &str, size: u64) {
@@ -444,6 +473,12 @@ impl Filesystem for VexFS {
     fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
         let name = self.files.get(&ino).map(|f| f.name.clone()).unwrap_or_default();
         if !name.is_empty() { self.ai_on_close(ino, &name); }
+
+        // Flush this file's buffered write immediately on close
+        if let Some((buf_data, buf_idx, buf_name)) = self.write_buffer.take(ino) {
+            self.persist_to_disk(ino, &buf_name, &buf_data, buf_idx);
+        }
+
         reply.ok();
     }
 
