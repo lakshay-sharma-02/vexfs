@@ -7,7 +7,7 @@ use fuser::{
     ReplyWrite, ReplyCreate, ReplyEmpty, ReplyStatfs,
     Request,
 };
-use libc::{ENOENT, ENOSPC, EEXIST, ENOTEMPTY, EINVAL, ENOTDIR, EACCES};
+use libc::{ENOENT, ENOSPC, EEXIST, ENOTEMPTY, EINVAL, ENOTDIR};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,17 +17,33 @@ use crate::fs::snapshot::SnapshotManager;
 use crate::fs::buffer::WriteBuffer;
 use crate::ai::persist::AIPersistence;
 use crate::fs::snapshot_disk::{DiskSnapshot, SNAPSHOT_MAGIC};
-use crate::ai::logger::{AccessLog, AccessEvent, AccessKind};
+use crate::ai::engine::{FsEvent, SharedAIState};
+use crate::ai::engine::AIEngine;
 use crate::ai::markov::MarkovPrefetcher;
 use crate::ai::importance::ImportanceEngine;
 use crate::ai::search::SearchIndex;
+use crate::ai::neural::NeuralPrefetcher;
 use crate::ai::entropy::EntropyGuard;
+use crate::ai::logger::AccessLog;
 use crate::cache::ArcCache;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
+
 
 /// Reserved inode number for the virtual .vexfs-search file
 const SEARCH_INO: u64 = 0xFFFFFFFE;
 /// Name of the virtual search file visible in ls
 const SEARCH_FILENAME: &str = ".vexfs-search";
+
+/// Reserved inode number for the virtual telemetry file
+const TELEMETRY_INO: u64 = 0xFFFFFFFD;
+/// Name of the virtual telemetry file
+const TELEMETRY_FILENAME: &str = ".vexfs-telemetry.json";
+
+/// Reserved inode number for the virtual ask (LLM query) file
+const ASK_INO: u64 = 0xFFFFFFFC;
+/// Name of the virtual ask file
+const ASK_FILENAME: &str = ".vexfs-ask";
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -47,45 +63,51 @@ pub struct VexFS {
     files: HashMap<u64, VexFile>,
     next_inode: u64,
     disk: DiskManager,
-    log: AccessLog,
-    markov: MarkovPrefetcher,
-    importance: ImportanceEngine,
-    search: SearchIndex,
     snapshots: SnapshotManager,
-    last_opened_ino: Option<u64>,
+    _last_opened_ino: Option<u64>,
     write_buffer: WriteBuffer,
-    ai_persist: AIPersistence,
+    _ai_persist: AIPersistence,
     /// ARC cache: ino → file data bytes. Hard ceiling: 64 MB.
     cache: ArcCache,
-    /// Ransomware / entropy guard — monitors every write
-    entropy_guard: EntropyGuard,
+    
+    // Asynchronous AI Engine communication
+    ai_tx: Sender<FsEvent>,
+    ai_state: Arc<RwLock<SharedAIState>>,
+    
     /// Virtual .vexfs-search: last query written by the user
     search_query: String,
-    /// Virtual .vexfs-search: last results ready to be read back
-    search_result: Vec<u8>,
+    /// Virtual .vexfs-ask: last question written by user
+    ask_query: String,
 }
 
 impl VexFS {
     pub fn new(disk: DiskManager, image_path: &str) -> Self {
+        let engine = AIEngine::new(
+            MarkovPrefetcher::new(50_000),
+            NeuralPrefetcher::new(),
+            ImportanceEngine::new(),
+            EntropyGuard::new(),
+            SearchIndex::new(),
+            AccessLog::new(10_000),
+        );
+        let (ai_tx, ai_state) = engine.spawn();
         Self {
             index: BPlusTree::new(),
             files: HashMap::new(),
             next_inode: 2,
             disk,
-            log: AccessLog::new(10_000),
-            markov: MarkovPrefetcher::new(50_000),
-            importance: ImportanceEngine::new(),
-            search: SearchIndex::new(),
             snapshots: SnapshotManager::new(10),
-            last_opened_ino: None,
+            _last_opened_ino: None,
             write_buffer: WriteBuffer::new(32, 5),
-            ai_persist: AIPersistence::new(image_path),
+            _ai_persist: AIPersistence::new(image_path),
             cache: ArcCache::new(64 * 1024 * 1024),
-            entropy_guard: EntropyGuard::new(),
+            ai_tx,
+            ai_state,
             search_query: String::new(),
-            search_result: Vec::new(),
+            ask_query: String::new(),
         }
     }
+
 
     pub fn load(mut disk: DiskManager, image_path: &str) -> Self {
         let mut index = BPlusTree::new();
@@ -205,20 +227,32 @@ impl VexFS {
                 markov.entry_count(), importance.stats.len());
         }
 
+                use crate::ai::engine::AIEngine;
+        use crate::ai::neural::NeuralPrefetcher;
+        use crate::ai::entropy::EntropyGuard;
+        use crate::ai::logger::AccessLog;
+        
+        let engine = AIEngine::new(
+            markov,
+            NeuralPrefetcher::new(),
+            importance,
+            EntropyGuard::new(),
+            search,
+            AccessLog::new(10_000),
+        );
+        let (ai_tx, ai_state) = engine.spawn();
+
         Self {
             index, files, next_inode, disk,
-            log: AccessLog::new(10_000),
-            markov,
-            importance,
-            search,
             snapshots,
-            last_opened_ino: None,
+            _last_opened_ino: None,
             write_buffer: WriteBuffer::new(32, 5),
-            ai_persist,
+            _ai_persist: ai_persist,
             cache,
-            entropy_guard: EntropyGuard::new(),
+            ai_tx,
+            ai_state,
             search_query: String::new(),
-            search_result: Vec::new(),
+            ask_query: String::new(),
         }
     }
 
@@ -357,37 +391,11 @@ impl VexFS {
             println!("VexFS: flushed {} buffered writes to disk", count);
         }
 
-        let _ = self.ai_persist.save(
-            &self.markov.transitions,
-            &self.importance.stats,
-        );
-        println!("VexFS AI: state saved to disk ({} Markov entries, {} file scores)",
-            self.markov.entry_count(),
-            self.importance.stats.len());
+        // AI State is persisted implicitly via engine, but we could add an explicit flush event if needed.
     }
 
     fn ai_on_open(&mut self, ino: u64, name: &str, size: u64) {
-        self.log.record(AccessEvent::now(ino, name, AccessKind::Open, size));
-
-        if let Some(prev) = self.last_opened_ino {
-            if prev != ino {
-                self.markov.record_transition(prev, ino, name);
-            }
-        }
-        self.last_opened_ino = Some(ino);
-        self.importance.record_access(ino, name, 0);
-
-        if let Some((pred_ino, pred_name, prob)) = self.markov.top_prediction(ino) {
-            let tier = self.importance.tier(pred_ino);
-            println!(
-                "VexFS AI: '{}' → predicting '{}' next ({:.0}%) [{}]",
-                name, pred_name, prob * 100.0, tier.label()
-            );
-        }
-
-        let tier = self.importance.tier(ino);
-        let score = self.importance.score(ino);
-        println!("VexFS AI: '{}' score={:.2} [{}]", name, score, tier.label());
+        let _ = self.ai_tx.send(FsEvent::Open { ino, name: name.to_string(), size });
     }
 
     fn ai_on_close(&mut self, ino: u64, name: &str) {
@@ -395,55 +403,71 @@ impl VexFS {
             .and_then(|f| f.open_since)
             .map(|t| Self::now_secs().saturating_sub(t))
             .unwrap_or(0);
-
-        self.log.record(AccessEvent::now(ino, name, AccessKind::Close, 0));
-        self.importance.record_access(ino, name, duration);
-
-        if let Some(f) = self.files.get_mut(&ino) {
-            f.open_since = None;
-        }
-    }
-
-    pub fn search(&self, query: &str) -> Vec<(String, f32, Vec<String>)> {
-        self.search.search(query)
-            .into_iter()
-            .map(|r| (r.name, r.score, r.matched_terms))
-            .collect()
+        let _ = self.ai_tx.send(FsEvent::Close { ino, name: name.to_string(), duration });
     }
 
     pub fn ai_status(&self) {
+        let state = self.ai_state.read().unwrap();
         println!("\n=== VexFS AI Status ===");
-        println!("Events logged:   {}", self.log.len());
-        println!("Markov entries:  {}", self.markov.entry_count());
-        println!("Search indexed:  {}", self.search.indexed_count());
+        println!("Markov entries:  {}", state.markov_entries);
+        println!("Search indexed:  {}", state.search_indexed);
         println!("Snapshots total: {}", self.snapshots.total_snapshots());
-        println!("Files backed up: {}", self.snapshots.files_with_snapshots());
         println!("Cache used:      {:.1} MB / {:.1} MB",
             self.cache.used_bytes() as f64 / 1_048_576.0,
             self.cache.max_bytes() as f64 / 1_048_576.0);
-        println!("{}", self.entropy_guard.status());
-
-        let ranked = self.importance.ranked_files();
-        if !ranked.is_empty() {
+        
+        if !state.ranked_files.is_empty() {
             println!("\nTop files:");
-            for f in ranked.iter().take(5) {
-                println!("  [{}] {} score={:.2} accessed={}x",
-                    f.tier.label(), f.name, f.score, f.access_count);
+            for (name, score, tier) in state.ranked_files.iter().take(5) {
+                println!("  [{}] {} score={:.2}", tier, name, score);
             }
         }
         println!("=======================\n");
     }
 
+
     /// Synthetic FileAttr for the virtual .vexfs-search file
     fn search_file_attr(&self) -> FileAttr {
+        let size = self.ai_state.read().unwrap().search_result.len() as u64;
         FileAttr {
             ino: SEARCH_INO,
-            size: self.search_result.len() as u64,
+            size,
             blocks: 1,
             atime: UNIX_EPOCH, mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
             kind: FileType::RegularFile,
             perm: 0o666,   // readable+writable by everyone
+            nlink: 1, uid: 1000, gid: 1000,
+            rdev: 0, blksize: 4096, flags: 0,
+        }
+    }
+
+    /// Synthetic FileAttr for the virtual telemetry file
+    fn telemetry_file_attr(&self) -> FileAttr {
+        FileAttr {
+            ino: TELEMETRY_INO,
+            size: 4096, // Approximate size since it's dynamic
+            blocks: 8,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o444,   // read-only by everyone
+            nlink: 1, uid: 1000, gid: 1000,
+            rdev: 0, blksize: 4096, flags: 0,
+        }
+    }
+
+    /// Synthetic FileAttr for the virtual .vexfs-ask file
+    fn ask_file_attr(&self) -> FileAttr {
+        let size = self.ai_state.read().unwrap().ask_result.len() as u64;
+        FileAttr {
+            ino: ASK_INO,
+            size,
+            blocks: 1,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o666,   // readable+writable
             nlink: 1, uid: 1000, gid: 1000,
             rdev: 0, blksize: 4096, flags: 0,
         }
@@ -458,6 +482,18 @@ impl Filesystem for VexFS {
         // Virtual .vexfs-search file
         if name_str == SEARCH_FILENAME {
             reply.entry(&TTL, &self.search_file_attr(), 0);
+            return;
+        }
+
+        // Virtual .vexfs-telemetry.json file
+        if name_str == TELEMETRY_FILENAME {
+            reply.entry(&TTL, &self.telemetry_file_attr(), 0);
+            return;
+        }
+
+        // Virtual .vexfs-ask file
+        if name_str == ASK_FILENAME {
+            reply.entry(&TTL, &self.ask_file_attr(), 0);
             return;
         }
 
@@ -481,6 +517,14 @@ impl Filesystem for VexFS {
             reply.attr(&TTL, &self.search_file_attr());
             return;
         }
+        if ino == TELEMETRY_INO {
+            reply.attr(&TTL, &self.telemetry_file_attr());
+            return;
+        }
+        if ino == ASK_INO {
+            reply.attr(&TTL, &self.ask_file_attr());
+            return;
+        }
         if let Some(file) = self.files.get(&ino) {
             reply.attr(&TTL, &file.attr);
         } else {
@@ -489,22 +533,75 @@ impl Filesystem for VexFS {
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
-        // Virtual .vexfs-search: return last search results
-        if ino == SEARCH_INO {
+        // Virtual .vexfs-ask: return last LLM/semantic answer
+        if ino == ASK_INO {
+            let state = self.ai_state.read().unwrap();
             let start = offset as usize;
-            let end = (start + size as usize).min(self.search_result.len());
-            if start < self.search_result.len() {
-                reply.data(&self.search_result[start..end]);
+            let end = (start + size as usize).min(state.ask_result.len());
+            if start < state.ask_result.len() {
+                reply.data(&state.ask_result[start..end]);
             } else {
                 reply.data(&[]);
             }
             return;
         }
 
-        if let Some(file) = self.files.get(&ino) {
-            let fname = file.name.clone();
-            let fsize = file.attr.size;
-            self.log.record(AccessEvent::now(ino, &fname, AccessKind::Read, fsize));
+        // Virtual .vexfs-search: return last search results
+        if ino == SEARCH_INO {
+            let state = self.ai_state.read().unwrap();
+            let start = offset as usize;
+            let end = (start + size as usize).min(state.search_result.len());
+            if start < state.search_result.len() {
+                reply.data(&state.search_result[start..end]);
+            } else {
+                reply.data(&[]);
+            }
+            return;
+        }
+
+        // Virtual telemetry file: generate live JSON on the fly
+        if ino == TELEMETRY_INO {
+            // Collect ranked files
+            let state = self.ai_state.read().unwrap();
+            let ranked = state.ranked_files.iter().take(10).map(|(name, score, tier)| {
+                format!(r#"{{"name":"{}","score":{},"tier":"{}"}}"#, name, score, tier)
+            }).collect::<Vec<_>>().join(",");
+
+            let json = format!(
+                r#"{{
+  "cache_used": {},
+  "cache_max": {},
+  "markov_entries": {},
+  "search_indexed": {},
+  "snapshots_total": {},
+  "entropy_threats": {},
+  "total_files": {},
+  "ranked_files": [{}]
+}}"#,
+                self.cache.used_bytes(),
+                self.cache.max_bytes(),
+                state.markov_entries,
+                state.search_indexed,
+                self.snapshots.total_snapshots(),
+                state.entropy_threats,
+                self.index.len(),
+                ranked
+            );
+            
+            let data = json.as_bytes();
+            let start = offset as usize;
+            let end = (start + size as usize).min(data.len());
+            if start < data.len() {
+                reply.data(&data[start..end]);
+            } else {
+                reply.data(&[]);
+            }
+            return;
+        }
+
+        if self.files.contains_key(&ino) {
+            // removed unused fname/fsize
+            
 
             // Read from ARC cache
             if let Some(data) = self.cache.get(ino) {
@@ -519,10 +616,10 @@ impl Filesystem for VexFS {
             }
 
             // Cache miss — load from disk
-            let file2 = self.files.get(&ino).unwrap();
-            let data_offset = file2.data_offset;
-            let data_size = file2.attr.size as usize;
-            drop(file2);
+            let (data_offset, data_size) = {
+                let file2 = self.files.get(&ino).unwrap();
+                (file2.data_offset, file2.attr.size as usize)
+            };
 
             let data = if data_size > 0 {
                 self.disk.read_file_data(data_offset, data_size).unwrap_or_default()
@@ -552,8 +649,10 @@ impl Filesystem for VexFS {
         let mut entries = vec![
             (1u64, FileType::Directory, ".".to_string()),
             (1u64, FileType::Directory, "..".to_string()),
-            // Virtual .vexfs-search file always visible in directory listing
+            // Virtual files always visible in directory listing
             (SEARCH_INO, FileType::RegularFile, SEARCH_FILENAME.to_string()),
+            (TELEMETRY_INO, FileType::RegularFile, TELEMETRY_FILENAME.to_string()),
+            (ASK_INO, FileType::RegularFile, ASK_FILENAME.to_string()),
         ];
 
         for (key, val) in self.index.list_all() {
@@ -604,9 +703,7 @@ impl Filesystem for VexFS {
         });
 
         self.cache.insert(ino, vec![]);
-        self.search.index(ino, &name_str, &[], Self::now_secs());
-        self.log.record(AccessEvent::now(ino, &name_str, AccessKind::Open, 0));
-        self.importance.record_access(ino, &name_str, 0);
+        let _ = self.ai_tx.send(FsEvent::Open { ino, name: name_str.clone(), size: 0 });
         println!("VexFS AI: created '{}'", name_str);
 
         self.flush_file(ino);
@@ -614,25 +711,24 @@ impl Filesystem for VexFS {
     }
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+        // Virtual .vexfs-ask: interpret write as a natural-language question
+        if ino == ASK_INO {
+            let question = String::from_utf8_lossy(data).trim().to_string();
+            if !question.is_empty() {
+                self.ask_query = question.clone();
+                let file_list: Vec<String> = self.files.values().take(50).map(|f| f.name.clone()).collect();
+                let _ = self.ai_tx.send(FsEvent::AskQuery { query: question, file_list });
+            }
+            reply.written(data.len() as u32);
+            return;
+        }
+
         // Virtual .vexfs-search: interpret write as a search query
         if ino == SEARCH_INO {
             let query = String::from_utf8_lossy(data).trim().to_string();
             if !query.is_empty() {
                 self.search_query = query.clone();
-                let results = self.search.search(&query);
-                let mut out = format!("VexFS Search: \"{}\" -- {} result(s)\n{}\n", query, results.len(), "-".repeat(48));
-                if results.is_empty() {
-                    out.push_str("  No results found.\n");
-                } else {
-                    for (i, r) in results.iter().enumerate() {
-                        out.push_str(&format!("  {}. {} (score: {:.3})\n", i + 1, r.name, r.score));
-                        if !r.matched_terms.is_empty() {
-                            out.push_str(&format!("     terms: {}\n", r.matched_terms.join(", ")));
-                        }
-                    }
-                }
-                self.search_result = out.into_bytes();
-                println!("VexFS Search: query='{}' → {} results", query, results.len());
+                let _ = self.ai_tx.send(FsEvent::SearchQuery { query });
             }
             reply.written(data.len() as u32);
             return;
@@ -644,27 +740,9 @@ impl Filesystem for VexFS {
         };
 
         // --- Entropy / ransomware check ---
-        if let Some(threat) = self.entropy_guard.check_write(ino, &name, data) {
-            println!("\n{} VexFS EntropyGuard: '{}' (ino={}) entropy={:.2}",
-                threat.label(), name, ino,
-                crate::ai::entropy::shannon_entropy(data));
-            match threat {
-                crate::ai::entropy::ThreatLevel::Critical => {
-                    println!("  ↳ File was plaintext, now receiving encrypted data!");
-                    println!("  ↳ Possible ransomware encryption in progress.");
-                }
-                crate::ai::entropy::ThreatLevel::Pattern => {
-                    println!("  ↳ Repeated high-entropy writes detected in 60s window.");
-                    println!("  ↳ Monitor this process carefully.");
-                }
-                crate::ai::entropy::ThreatLevel::Extension => {
-                    println!("  ↳ Suspicious file extension detected.");
-                }
-                crate::ai::entropy::ThreatLevel::Warning => {
-                    println!("  ↳ High-entropy write — may be compressed or encrypted data.");
-                }
-            }
-        }
+        let data_vec = data.to_vec();
+        let _ = self.ai_tx.send(FsEvent::Write { ino, name: name.clone(), data: data_vec });
+
 
         // Auto-snapshot before overwriting existing content
         {
@@ -702,8 +780,8 @@ impl Filesystem for VexFS {
             return;
         }
 
-        self.search.index(ino, &name, &new_data, Self::now_secs());
-        self.log.record(AccessEvent::now(ino, &name, AccessKind::Write, data.len() as u64));
+        
+        
         let written = data.len() as u32;
         self.flush_file(ino);
         reply.written(written);
@@ -723,6 +801,9 @@ impl Filesystem for VexFS {
 
     fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<std::time::SystemTime>, _fh: Option<u64>, _crtime: Option<std::time::SystemTime>, _chgtime: Option<std::time::SystemTime>, _bkuptime: Option<std::time::SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
         if ino == 1 { reply.attr(&TTL, &Self::root_attr()); return; }
+        if ino == SEARCH_INO { reply.attr(&TTL, &self.search_file_attr()); return; }
+        if ino == TELEMETRY_INO { reply.attr(&TTL, &self.telemetry_file_attr()); return; }
+        if ino == ASK_INO { reply.attr(&TTL, &self.ask_file_attr()); return; }
 
         // Handle truncate — shell does this before writing to existing file
         if let Some(new_size) = size {
@@ -794,11 +875,11 @@ impl Filesystem for VexFS {
                 }
             }
 
-            self.search.remove(ino);
+            let _ = self.ai_tx.send(FsEvent::Delete { ino, name: name_str.clone() });
             self.snapshots.remove_file(ino);
             self.cache.remove(ino);
             self.write_buffer.take(ino); // cancel any pending write
-            self.log.record(AccessEvent::now(ino, &name_str, AccessKind::Delete, 0));
+            
             self.files.remove(&ino);
             let empty = DiskInode::empty();
             let _ = self.disk.write_inode(btval.disk_index, &empty);
@@ -850,7 +931,7 @@ impl Filesystem for VexFS {
                     self.disk.free_data(f.data_offset, f.attr.size);
                 }
             }
-            self.search.remove(dst_ino);
+            
             self.snapshots.remove_file(dst_ino);
             self.cache.remove(dst_ino);
             self.write_buffer.take(dst_ino);
@@ -875,10 +956,7 @@ impl Filesystem for VexFS {
             f.name = dst.clone();
         }
 
-        // Re-index in search under new name
-        let cached_data = self.cache.get(src_ino).cloned().unwrap_or_default();
-        self.search.remove(src_ino);
-        self.search.index(src_ino, &dst, &cached_data, Self::now_secs());
+        
 
         // Persist the rename to disk
         let disk_index = src_val.disk_index;
