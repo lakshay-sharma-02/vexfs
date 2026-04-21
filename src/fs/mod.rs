@@ -17,6 +17,16 @@ pub const INODE_SIZE: usize = 256;
 pub const SNAPSHOT_TABLE_SIZE: u64 = 256 * 512; // 256 slots * 512 bytes
 pub const DATA_OFFSET: u64 = 4096 + (MAX_FILES as u64 * INODE_SIZE as u64) + SNAPSHOT_TABLE_SIZE;
 
+/// Maximum number of free data extents tracked in the free list
+pub const MAX_FREE_EXTENTS: usize = 256;
+
+/// A free extent on disk: (offset, length_bytes)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FreeExtent {
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Superblock {
@@ -26,7 +36,7 @@ pub struct Superblock {
     pub total_blocks: u64,
     pub free_blocks: u64,
     pub inode_count: u64,
-    pub next_data_offset: u64,  // tracked on disk now
+    pub next_data_offset: u64,  // append cursor
     pub created_at: u64,
     _pad: [u8; 16],
 }
@@ -83,7 +93,6 @@ impl DiskInode {
 
     pub fn is_valid(&self) -> bool {
         if self.is_used == 0 { return false; }
-        // Name must start with a valid ASCII char
         let first = self.name[0];
         if first == 0 { return false; }
         if !first.is_ascii_graphic() { return false; }
@@ -93,11 +102,10 @@ impl DiskInode {
     pub fn get_name(&self) -> String {
         let end = self.name.iter().position(|&b| b == 0).unwrap_or(208);
         let s = String::from_utf8_lossy(&self.name[..end]).to_string();
-        // Validate name — only printable ASCII
         if s.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || "._- ".contains(c))) {
             s
         } else {
-            String::new() // corrupted — return empty
+            String::new()
         }
     }
 
@@ -115,6 +123,8 @@ const _: () = assert!(std::mem::size_of::<DiskInode>() == 256);
 pub struct DiskManager {
     file: File,
     pub superblock: Superblock,
+    /// In-memory free list: extents of data bytes we can reuse
+    free_list: Vec<FreeExtent>,
 }
 
 impl DiskManager {
@@ -127,7 +137,7 @@ impl DiskManager {
                 "Invalid VexFS magic — format the disk first"
             ));
         }
-        Ok(Self { file, superblock })
+        Ok(Self { file, superblock, free_list: Vec::new() })
     }
 
     pub fn format(path: &str, size_bytes: u64) -> std::io::Result<Self> {
@@ -145,7 +155,7 @@ impl DiskManager {
         file.write_all(&zeroes)?;
         file.flush()?;
 
-        Ok(Self { file, superblock })
+        Ok(Self { file, superblock, free_list: Vec::new() })
     }
 
     fn read_superblock(file: &mut File) -> std::io::Result<Superblock> {
@@ -193,8 +203,16 @@ impl DiskManager {
         Ok(unsafe { *(buf.as_ptr() as *const DiskInode) })
     }
 
-    /// Allocate space for file data — returns offset where data should be written
+    /// Allocate space for file data. Tries to reuse a freed extent first,
+    /// then falls back to appending at next_data_offset.
     pub fn alloc_data(&mut self, size: usize) -> u64 {
+        // Try to find a free extent large enough
+        if let Some(idx) = self.free_list.iter().position(|e| e.length >= size as u64) {
+            let extent = self.free_list.remove(idx);
+            return extent.offset;
+        }
+
+        // Append-allocate
         let offset = self.superblock.next_data_offset;
         self.superblock.next_data_offset += size as u64;
         // Align to 512 bytes
@@ -203,6 +221,15 @@ impl DiskManager {
             self.superblock.next_data_offset += 512 - remainder;
         }
         offset
+    }
+
+    /// Return a data extent to the free list so it can be reused.
+    pub fn free_data(&mut self, offset: u64, length: u64) {
+        if offset == 0 || length == 0 { return; }
+        // Cap free list size to avoid unbounded growth
+        if self.free_list.len() < MAX_FREE_EXTENTS {
+            self.free_list.push(FreeExtent { offset, length });
+        }
     }
 
     pub fn write_file_data(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -219,7 +246,6 @@ impl DiskManager {
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
-        // Always persist superblock (has next_data_offset)
         let _ = self.write_superblock();
         self.file.flush()
     }
@@ -285,5 +311,3 @@ impl DiskManager {
             .count()
     }
 }
-
-

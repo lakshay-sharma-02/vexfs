@@ -9,6 +9,30 @@ license = "MIT"
 name = "vexfs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "vexfs"
+path = "src/bin/vexfs.rs"
+
+[[bin]]
+name = "mkfs_vexfs"
+path = "src/bin/mkfs_vexfs.rs"
+
+[[bin]]
+name = "vexfs_search"
+path = "src/bin/vexfs_search.rs"
+
+[[bin]]
+name = "vexfs_snapshot"
+path = "src/bin/vexfs_snapshot.rs"
+
+[[bin]]
+name = "vexfs_status"
+path = "src/bin/vexfs_status.rs"
+
+[[bin]]
+name = "vexfs_bench"
+path = "src/bin/vexfs_bench.rs"
+
 [dependencies]
 fuser = "0.14"
 libc = "0.2"

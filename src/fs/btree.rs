@@ -42,6 +42,7 @@ enum RemoveResult {
     NotFound,
 }
 
+#[allow(dead_code)]
 impl Node {
     fn new_leaf() -> Self {
         Node::Leaf { keys: vec![], vals: vec![] }

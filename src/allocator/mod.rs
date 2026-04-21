@@ -1,5 +1,6 @@
 //! Slab allocator — O(1) allocation, zero fragmentation
 
+#[allow(dead_code)]
 pub struct SlabAllocator {
     arena: Vec<u8>,
     total: usize,
