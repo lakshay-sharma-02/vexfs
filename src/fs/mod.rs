@@ -7,6 +7,7 @@ pub mod snapshot;
 pub mod disk;
 pub mod journal;
 pub mod free_list;
+pub mod compress;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -313,9 +314,14 @@ impl DiskManager {
 // ── Backward-compatibility re-exports (used by existing bins) ────────────────
 
 // These let existing code that imports `vexfs::fs::DiskInode` etc. keep working.
+// Backward-compatible re-export — points to the SAFE disk.rs implementation
 pub mod snapshot_disk {
     pub use super::disk::SnapshotRaw as DiskSnapshot;
-    pub use super::{MAX_SNAPSHOT_SLOTS as MAX_SNAPSHOTS, SNAPSHOT_RECORD_SIZE, SNAPSHOT_TABLE_OFFSET};
+    pub use super::{
+        MAX_SNAPSHOT_SLOTS as MAX_SNAPSHOTS,
+        SNAPSHOT_RECORD_SIZE,
+        SNAPSHOT_TABLE_OFFSET,
+    };
     pub const SNAPSHOT_MAGIC: u64 = 0x534E415000000001;
 }
 

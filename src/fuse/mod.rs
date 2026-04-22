@@ -128,8 +128,9 @@ impl VexFS {
 
             // Load file data into the ARC cache eagerly on mount
             let data = if inode.size > 0 {
-                disk.read_file_data(inode.data_offset, inode.size as usize)
-                    .unwrap_or_default()
+                let raw = disk.read_file_data(inode.data_offset, inode.size as usize)
+                    .unwrap_or_default();
+                crate::fs::compress::decompress(&raw)
             } else {
                 vec![]
             };
@@ -210,6 +211,15 @@ impl VexFS {
         let mut markov = MarkovPrefetcher::new(50_000);
         let mut importance = ImportanceEngine::new();
 
+        let neural = ai_persist.load_neural()
+            .and_then(|b| NeuralPrefetcher::from_bytes(&b))
+            .unwrap_or_else(NeuralPrefetcher::new);
+
+        if ai_persist.neural_path().parse::<std::path::PathBuf>().is_ok() && std::path::Path::new(&ai_persist.neural_path()).exists() {
+             println!("VexFS AI: restored neural prefetcher (vocab={} accesses={})",
+                neural.vocab_size(), neural.total_accesses);
+        }
+
         for (from_ino, transitions) in saved_markov {
             for (to_ino, name, count) in transitions {
                 for _ in 0..count {
@@ -227,14 +237,13 @@ impl VexFS {
                 markov.entry_count(), importance.stats.len());
         }
 
-                use crate::ai::engine::AIEngine;
-        use crate::ai::neural::NeuralPrefetcher;
+        use crate::ai::engine::AIEngine;
         use crate::ai::entropy::EntropyGuard;
         use crate::ai::logger::AccessLog;
         
         let engine = AIEngine::new(
             markov,
-            NeuralPrefetcher::new(),
+            neural,
             importance,
             EntropyGuard::new(),
             search,
@@ -342,6 +351,8 @@ impl VexFS {
     }
 
     fn persist_to_disk(&mut self, ino: u64, name: &str, data: &[u8], disk_index: usize) {
+        use crate::fs::compress;
+
         // Free the old data extent before writing a new one
         if let Some(f) = self.files.get(&ino) {
             if f.data_offset > 0 && f.attr.size > 0 {
@@ -351,14 +362,42 @@ impl VexFS {
             }
         }
 
-        let data_offset = if !data.is_empty() {
-            self.disk.alloc_data(data.len())
+        // Determine storage tier from AI state
+        let tier = {
+            let state = self.ai_state.read().unwrap();
+            state.ranked_files.iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, _, t)| t.as_str())
+                .unwrap_or("COLD")
+                .to_string()
+        };
+
+        // Compress COLD-tier files to save space
+        let data_to_write: Vec<u8> = if tier.contains("COLD") && data.len() >= 512 {
+            let c = compress::compress(data);
+            if c.len() < data.len() {
+                println!("VexFS: 🗜  compressed '{}' {:.1}KB → {:.1}KB ({:.0}% smaller)",
+                    name,
+                    data.len() as f64 / 1024.0,
+                    c.len() as f64 / 1024.0,
+                    (1.0 - c.len() as f64 / data.len() as f64) * 100.0);
+                c
+            } else {
+                data.to_vec()
+            }
+        } else {
+            data.to_vec()
+        };
+
+        let data_offset = if !data_to_write.is_empty() {
+            self.disk.alloc_data(data_to_write.len())
         } else {
             DATA_OFFSET
         };
 
         let mut disk_inode = DiskInode::empty();
         disk_inode.ino = ino;
+        // Store ORIGINAL (uncompressed) size in inode so getattr returns correct size
         disk_inode.size = data.len() as u64;
         disk_inode.data_offset = data_offset;
         disk_inode.is_used = 1;
@@ -367,14 +406,13 @@ impl VexFS {
         disk_inode.modified_at = Self::now_secs();
         disk_inode.set_name(name);
 
-        if !data.is_empty() {
-            let _ = self.disk.write_file_data(data_offset, data);
+        if !data_to_write.is_empty() {
+            let _ = self.disk.write_file_data(data_offset, &data_to_write);
         }
 
         let _ = self.disk.write_inode(disk_index, &disk_inode);
         let _ = self.disk.flush();
 
-        // Update in-memory data_offset so next overwrite frees the right extent
         if let Some(f) = self.files.get_mut(&ino) {
             f.data_offset = data_offset;
         }
@@ -391,7 +429,24 @@ impl VexFS {
             println!("VexFS: flushed {} buffered writes to disk", count);
         }
 
-        // AI State is persisted implicitly via engine, but we could add an explicit flush event if needed.
+        // Save AI state (Markov + importance are saved via engine sync)
+        // Neural weights — read from AI state and persist
+        // We trigger a shutdown sync by reading shared state
+        let _ = self.ai_tx.send(FsEvent::SyncAI);
+        
+        let state = self.ai_state.read().unwrap();
+
+        // Persist AI data to disk
+        if let Err(e) = self._ai_persist.save(&state.markov_data, &state.importance_data) {
+            eprintln!("VexFS AI: failed to save state: {}", e);
+        }
+        if let Err(e) = self._ai_persist.save_neural(&state.neural_weights) {
+            eprintln!("VexFS AI: failed to save neural weights: {}", e);
+        }
+
+        println!("VexFS AI: {} Markov entries, {} files indexed at shutdown",
+            state.markov_entries, state.search_indexed);
+        drop(state);
     }
 
     fn ai_on_open(&mut self, ino: u64, name: &str, size: u64) {
@@ -475,6 +530,10 @@ impl VexFS {
 }
 
 impl Filesystem for VexFS {
+    fn destroy(&mut self) {
+        self.flush_all();
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         if parent != 1 { reply.error(ENOENT); return; }
         let name_str = name.to_string_lossy().to_string();
@@ -621,11 +680,14 @@ impl Filesystem for VexFS {
                 (file2.data_offset, file2.attr.size as usize)
             };
 
-            let data = if data_size > 0 {
+            let raw = if data_size > 0 {
                 self.disk.read_file_data(data_offset, data_size).unwrap_or_default()
             } else {
                 vec![]
             };
+
+            // Transparently decompress if needed
+            let data = crate::fs::compress::decompress(&raw);
 
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
@@ -699,7 +761,7 @@ impl Filesystem for VexFS {
             disk_index: slot,
             dirty: true,
             open_since: Some(Self::now_secs()),
-            data_offset: DATA_OFFSET,
+            data_offset: 0,
         });
 
         self.cache.insert(ino, vec![]);
@@ -747,7 +809,9 @@ impl Filesystem for VexFS {
         // Auto-snapshot before overwriting existing content
         {
             let existing_data = self.cache.get(ino).cloned().unwrap_or_default();
-            if !existing_data.is_empty() {
+            // Only take an auto-snapshot if writing from the beginning of the file
+            // This prevents snapshot spam during sequential appends or chunked writes.
+            if !existing_data.is_empty() && offset == 0 {
                 let snap_name = name.clone();
                 let snap_offset = existing_data.len() as u64;
                 self.snapshots.snapshot(ino, &snap_name, &existing_data, snap_offset);
@@ -821,6 +885,16 @@ impl Filesystem for VexFS {
                         let data_offset = self.disk.alloc_data(existing_data.len());
                         let _ = self.disk.write_file_data(data_offset, &existing_data);
 
+                        // Guard: warn when approaching limit
+                        let used_snap_slots = (0..256)
+                            .filter(|&i| self.disk.read_snapshot(i)
+                                .map(|s| s.is_used == 1)
+                                .unwrap_or(false))
+                            .count();
+                        if used_snap_slots >= 240 {
+                            eprintln!("VexFS WARN: snapshot table {}/256 slots used — approaching limit", used_snap_slots);
+                        }
+
                         if let Some(slot) = self.disk.find_free_snapshot_slot() {
                             let mut disk_snap = DiskSnapshot::empty();
                             disk_snap.magic = SNAPSHOT_MAGIC;
@@ -833,10 +907,16 @@ impl Filesystem for VexFS {
                             disk_snap.set_name(&snap_name);
                             let _ = self.disk.write_snapshot(slot, &disk_snap);
                             let _ = self.disk.flush();
+                            println!("VexFS: 📸 snapshot of '{}' persisted to disk (v{}, total: {})",
+                                snap_name, snap_id, self.snapshots.total_snapshots());
+                        } else {
+                            // NEW: warn instead of silently dropping
+                            eprintln!("VexFS WARN: snapshot table full (256 slots used). \
+                                Run `vexfs-snapshot gc {}` to prune old snapshots. \
+                                Snapshot for '{}' v{} was NOT persisted to disk.",
+                                "your.img", snap_name, snap_id);
+                            // In-memory snapshot still exists, just not on disk
                         }
-
-                        println!("VexFS: 📸 snapshot of '{}' persisted to disk (v{}, total: {})",
-                            snap_name, snap_id, self.snapshots.total_snapshots());
                     }
                 }
             }

@@ -188,6 +188,60 @@ impl AIPersistence {
         }
         Ok(())
     }
+
+    /// Save neural prefetcher weights alongside the Markov/importance data.
+    pub fn save_neural(&self, neural_bytes: &[u8]) -> std::io::Result<()> {
+        let path = format!("{}.neural", self.path.trim_end_matches(".ai"));
+        // Simple format: [8 magic][4 len][N bytes neural data][32 blake3]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"VEXNERL1");
+        buf.extend_from_slice(&(neural_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(neural_bytes);
+        let hash = blake3::Hasher::new().update(&buf).finalize();
+        buf.extend_from_slice(hash.as_bytes());
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open(&path)?;
+        file.write_all(&buf)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Load neural prefetcher weights. Returns None on any error.
+    pub fn load_neural(&self) -> Option<Vec<u8>> {
+        let path = format!("{}.neural", self.path.trim_end_matches(".ai"));
+        let raw = std::fs::read(&path).ok()?;
+
+        if raw.len() < 8 + 4 + 32 { return None; }
+
+        let payload = &raw[..raw.len() - 32];
+        let stored_hash = &raw[raw.len() - 32..];
+        let computed = blake3::Hasher::new().update(payload).finalize();
+        if computed.as_bytes() != stored_hash {
+            eprintln!("VexFS AI: .neural file checksum mismatch — ignoring");
+            return None;
+        }
+
+        if &payload[..8] != b"VEXNERL1" { return None; }
+
+        let len = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
+        if 12 + len > payload.len() { return None; }
+
+        Some(payload[12..12 + len].to_vec())
+    }
+
+    pub fn neural_path(&self) -> String {
+        format!("{}.neural", self.path.trim_end_matches(".ai"))
+    }
+
+    pub fn delete_neural(&self) -> std::io::Result<()> {
+        let path = self.neural_path();
+        if std::path::Path::new(&path).exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

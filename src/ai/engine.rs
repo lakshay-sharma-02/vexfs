@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::collections::HashMap;
 
 use super::markov::MarkovPrefetcher;
 use super::neural::NeuralPrefetcher;
@@ -17,6 +18,7 @@ pub enum FsEvent {
     SyncCacheSize { used: u64, max: u64 },
     SearchQuery { query: String },
     AskQuery { query: String, file_list: Vec<String> }, // FUSE supplies the filesystem context
+    SyncAI, // Trigger a full sync of all AI data for persistence
 }
 
 #[derive(Default)]
@@ -32,6 +34,11 @@ pub struct SharedAIState {
     // Result caches for virtual files
     pub search_result: Vec<u8>,
     pub ask_result: Vec<u8>,
+
+    // Full AI data for persistence (populated on SyncAI)
+    pub markov_data: HashMap<u64, Vec<(u64, String, u32)>>,
+    pub importance_data: HashMap<u64, (String, u32, u64, u64)>,
+    pub neural_weights: Vec<u8>,
 }
 
 pub struct AIEngine {
@@ -43,6 +50,8 @@ pub struct AIEngine {
     pub log: AccessLog,
     
     last_opened_ino: Option<u64>,
+    // NEW: accumulates write chunks per inode until file is closed
+    write_accumulator: std::collections::HashMap<u64, Vec<u8>>,
 }
 
 impl AIEngine {
@@ -62,6 +71,7 @@ impl AIEngine {
             search,
             log,
             last_opened_ino: None,
+            write_accumulator: std::collections::HashMap::new(),
         }
     }
 
@@ -121,13 +131,12 @@ impl AIEngine {
 
             FsEvent::Write { ino, name, data } => {
                 let bytes_len = data.len();
-                
+
                 // --- Entropy / ransomware check ---
                 if let Some(threat) = self.entropy_guard.check_write(ino, &name, &data) {
                     let h = crate::ai::entropy::shannon_entropy(&data);
                     println!("\n{} VexFS EntropyGuard: '{}' (ino={}) entropy={:.2}",
                         threat.label(), name, ino, h);
-                    
                     match threat {
                         ThreatLevel::Critical => {
                             println!("  ↳ File was plaintext, now receiving encrypted data!");
@@ -145,23 +154,31 @@ impl AIEngine {
                     }
                 }
 
-                // AI Indexing
-                // use current timestamp roughly for simplicity
+                // Accumulate write chunks per inode so TF-IDF sees full content
+                let full_content = {
+                    let acc = self.write_accumulator.entry(ino).or_default();
+                    acc.extend_from_slice(&data);
+                    acc.clone()
+                };
+
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                self.search.index(ino, &name, &data, now);
+                self.search.index(ino, &name, &full_content, now);
                 self.log.record(AccessEvent::now(ino, &name, AccessKind::Write, bytes_len as u64));
             }
 
             FsEvent::Close { ino, name, duration } => {
                 self.log.record(AccessEvent::now(ino, &name, AccessKind::Close, 0));
                 self.importance.record_access(ino, &name, duration);
+                // Clear write accumulator — file is closed, index is up to date
+                self.write_accumulator.remove(&ino);
             }
 
             FsEvent::Delete { ino, name } => {
                 self.search.remove(ino);
+                self.write_accumulator.remove(&ino);
                 self.log.record(AccessEvent::now(ino, &name, AccessKind::Delete, 0));
             }
             
@@ -192,6 +209,10 @@ impl AIEngine {
 
             FsEvent::AskQuery { query, file_list } => {
                 self.run_ask_query(&query, file_list);
+            }
+            FsEvent::SyncAI => {
+                // sync_state is called after every event anyway, 
+                // but this event ensures we hit the full data sync logic.
             }
         }
     }
@@ -242,5 +263,10 @@ impl AIEngine {
         // Since SearchIndex is borrowed mutably during operations, we stash results there or in engine
         w.search_result = self.search.last_query_result.clone();
         w.ask_result = self.search.last_ask_result.clone();
+
+        // Populate full data for persistence
+        w.markov_data = self.markov.transitions.clone();
+        w.importance_data = self.importance.stats.clone();
+        w.neural_weights = self.neural.to_bytes();
     }
 }

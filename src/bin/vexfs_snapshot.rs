@@ -24,6 +24,7 @@ fn main() {
         eprintln!("  vexfs-snapshot all <image>");
         eprintln!("  vexfs-snapshot list <image> <filename>");
         eprintln!("  vexfs-snapshot restore <image> <filename> <version>");
+        eprintln!("  vexfs-snapshot gc <image> [keep_per_file]");
         std::process::exit(1);
     }
 
@@ -40,6 +41,10 @@ fn main() {
             if args.len() < 5 { eprintln!("Usage: vexfs-snapshot restore <image> <filename> <version>"); std::process::exit(1); }
             let version: u32 = args[4].parse().expect("version must be a number");
             cmd_restore(image, &args[3], version);
+        }
+        "gc" => {
+            let keep: usize = if args.len() >= 4 { args[3].parse().unwrap_or(3) } else { 3 };
+            cmd_gc(image, keep);
         }
         _ => { eprintln!("Unknown command: {}", cmd); std::process::exit(1); }
     }
@@ -173,4 +178,54 @@ fn cmd_restore(image: &str, filename: &str, version: u32) {
 
     eprintln!("File '{}' not found in filesystem.", filename);
     std::process::exit(1);
+}
+
+fn cmd_gc(image: &str, keep: usize) {
+    let mut disk = DiskManager::open(image).expect("Failed to open image");
+
+    let mut by_file: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+
+    // Group valid snapshots by inode
+    for i in 0..MAX_SNAPSHOTS {
+        let s = match disk.read_snapshot(i) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if s.is_valid(SNAPSHOT_MAGIC) {
+            by_file.entry(s.ino).or_default().push(i);
+        }
+    }
+
+    let mut removed = 0;
+    let mut bytes_freed = 0;
+
+    for (_, mut slots) in by_file {
+        if slots.len() <= keep { continue; }
+        
+        // Sort slots by timestamp descending
+        slots.sort_by(|&a, &b| {
+            let sa = disk.read_snapshot(a).unwrap();
+            let sb = disk.read_snapshot(b).unwrap();
+            sb.timestamp.cmp(&sa.timestamp)
+        });
+
+        // Remove older snapshots
+        for &slot in slots.iter().skip(keep) {
+            if let Ok(mut s) = disk.read_snapshot(slot) {
+                // Free the data extent
+                disk.free_data(s.data_offset, s.size);
+                bytes_freed += s.size;
+                
+                // Mark slot as unused
+                s.is_used = 0;
+                let _ = disk.write_snapshot(slot, &s);
+                removed += 1;
+            }
+        }
+    }
+
+    let _ = disk.flush();
+    println!("✓ Garbage collection complete.");
+    println!("  Removed {} old snapshots.", removed);
+    println!("  Freed {} bytes of disk space.", bytes_freed);
 }

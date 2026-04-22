@@ -49,6 +49,8 @@ pub struct ImportanceEngine {
     pub stats: HashMap<u64, (String, u32, u64, u64)>,
 }
 
+pub const MAX_TRACKED_FILES: usize = 10_000;
+
 impl ImportanceEngine {
     pub fn new() -> Self {
         Self { stats: HashMap::new() }
@@ -60,6 +62,18 @@ impl ImportanceEngine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // Cap: if at limit and this is a new file, evict the lowest-scored entry
+        if !self.stats.contains_key(&ino) && self.stats.len() >= MAX_TRACKED_FILES {
+            // Find and remove the lowest scored entry
+            let to_remove = self.stats.iter()
+                .map(|(k, _)| (*k, self.score(*k)))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(k, _)| k);
+            if let Some(k) = to_remove {
+                self.stats.remove(&k);
+            }
+        }
 
         let entry = self.stats.entry(ino).or_insert((name.to_string(), 0, 0, 0));
         entry.1 += 1;                          // increment access count
