@@ -10,6 +10,7 @@ VEXFS_MNT="${1:-$HOME/mnt/vexfs}"
 IMAGE="${2:-$HOME/vexfs.img}"
 TMP_BASELINE="/tmp/vexfs_bench_baseline"
 BINARY="./target/release/vexfs_bench"
+RESULTS_FILE="/tmp/vexfs_bench_results.txt"
 
 RED='\033[0;31m'
 GRN='\033[0;32m'
@@ -36,16 +37,13 @@ section() {
 
 check_deps() {
     local missing=0
-    for cmd in cargo fusermount; do
+    for cmd in cargo fusermount awk; do
         if ! command -v "$cmd" &>/dev/null; then
             echo -e "${RED}✗ Missing: $cmd${RST}"
             missing=1
         fi
     done
-    if [ $missing -ne 0 ]; then
-        echo -e "${YLW}Install missing tools and retry.${RST}"
-        exit 1
-    fi
+    [ $missing -ne 0 ] && { echo -e "${YLW}Install missing tools and retry.${RST}"; exit 1; }
 }
 
 build_release() {
@@ -101,22 +99,76 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_bench() {
-    local label="$1"
-    local target="$2"
-    echo ""
-    echo -e "  ${BOLD}Target: $label ($target)${RST}"
-    "$BINARY" "$target" 2>/dev/null
+# Run bench and extract a single metric by label pattern
+extract_metric() {
+    local file="$1"
+    local pattern="$2"
+    grep "$pattern" "$file" | awk '{print $(NF-1)}' | head -1
 }
 
-compare_heading() {
+print_comparison() {
+    local vexfs_file="$1"
+    local tmpfs_file="$2"
+
     echo ""
-    echo -e "${BOLD}${BLU}  COMPARISON SUMMARY${RST}"
-    echo -e "  ${CYN}VexFS = AI-augmented FUSE filesystem${RST}"
-    echo -e "  ${CYN}tmpfs = in-memory baseline (theoretical max throughput)${RST}"
+    echo -e "${BOLD}${BLU}╔══════════════════════════════════════════════════════════════╗${RST}"
+    echo -e "${BOLD}${BLU}║              SIDE-BY-SIDE COMPARISON                        ║${RST}"
+    echo -e "${BOLD}${BLU}╚══════════════════════════════════════════════════════════════╝${RST}"
+    printf "\n  %-38s %12s %12s %10s\n" "Metric" "VexFS" "tmpfs" "Ratio"
+    echo "  ──────────────────────────────────────────────────────────────────"
+
+    compare_row() {
+        local label="$1"
+        local pattern="$2"
+        local unit="$3"
+        local higher_is_better="${4:-1}"  # 1 = higher is better (throughput), 0 = lower is better (latency)
+
+        local vval
+        local tval
+        vval=$(extract_metric "$vexfs_file" "$pattern")
+        tval=$(extract_metric "$tmpfs_file" "$pattern")
+
+        if [ -z "$vval" ] || [ -z "$tval" ]; then
+            printf "  %-38s %12s %12s %10s\n" "$label" "${vval:-n/a}" "${tval:-n/a}" "n/a"
+            return
+        fi
+
+        local ratio
+        ratio=$(awk "BEGIN {
+            if ($tval != 0) printf \"%.2f\", $vval / $tval;
+            else print \"inf\"
+        }")
+
+        # Color: green if VexFS is within 2x of tmpfs, yellow within 5x, red beyond 5x
+        local color="$GRN"
+        local ratio_num
+        ratio_num=$(awk "BEGIN { printf \"%.2f\", $ratio }" 2>/dev/null || echo "0")
+        if [ "$higher_is_better" -eq 1 ]; then
+            # throughput — ratio < 0.5 is bad
+            awk "BEGIN { exit ($ratio_num < 0.2) ? 0 : 1 }" && color="$RED" || \
+            awk "BEGIN { exit ($ratio_num < 0.5) ? 0 : 1 }" && color="$YLW" || true
+        else
+            # latency — ratio > 5 is bad
+            awk "BEGIN { exit ($ratio_num > 5.0) ? 0 : 1 }" && color="$RED" || \
+            awk "BEGIN { exit ($ratio_num > 2.0) ? 0 : 1 }" && color="$YLW" || true
+        fi
+
+        printf "  %-38s %12s %12s ${color}%10sx${RST}\n" \
+            "$label" "${vval} ${unit}" "${tval} ${unit}" "$ratio"
+    }
+
+    compare_row "Seq write 16MB"       "sequential write"  "MB/s" 1
+    compare_row "Seq read 16MB"        "sequential read"   "MB/s" 1
+    compare_row "File create (200)"    "file creates"      "ms"   0
+    compare_row "Random reads (1000)"  "random reads"      "µs"   0
+    compare_row "Overwrites (100)"     "overwrites"        "ms"   0
+    compare_row "Renames (100)"        "renames"           "ms"   0
+
     echo ""
-    echo -e "  ${YLW}Note: VexFS overhead = AI indexing + entropy check + ARC cache${RST}"
-    echo -e "  ${YLW}      This trades raw throughput for semantic search + safety${RST}"
+    echo -e "  ${YLW}Note: VexFS overhead = AI indexing + entropy check + ARC cache + FUSE${RST}"
+    echo -e "  ${YLW}      tmpfs is in-memory — this is the theoretical maximum${RST}"
+    echo -e "  ${CYN}      Green = within 2x  Yellow = 2-5x slower  Red = >5x slower${RST}"
+    echo ""
 }
 
 # ─────────────────────── MAIN ───────────────────────
@@ -129,33 +181,36 @@ ensure_mount
 mkdir -p "$TMP_BASELINE"
 
 section "VexFS Benchmark"
-run_bench "VexFS (AI-augmented FUSE)" "$VEXFS_MNT"
+VEXFS_RESULTS=$(mktemp)
+"$BINARY" "$VEXFS_MNT" 2>/dev/null | tee "$VEXFS_RESULTS"
 
 section "tmpfs Baseline"
-run_bench "tmpfs (in-memory baseline)" "$TMP_BASELINE"
+TMPFS_RESULTS=$(mktemp)
+"$BINARY" "$TMP_BASELINE" 2>/dev/null | tee "$TMPFS_RESULTS"
 
-compare_heading
+print_comparison "$VEXFS_RESULTS" "$TMPFS_RESULTS"
+
+rm -f "$VEXFS_RESULTS" "$TMPFS_RESULTS"
 
 section "Entropy Detection Demo"
 echo -e "  ${BLU}Writing encrypted-looking data to VexFS...${RST}"
 python3 -c "
-import sys, random
-# Generate high-entropy data (looks like ransomware payload)
+import sys
 data = bytes(range(256)) * 256
 sys.stdout.buffer.write(data)
 " > "$VEXFS_MNT/suspicious.enc" 2>/dev/null && \
     echo -e "  ${RED}🚨 Check VexFS logs — entropy alert should have fired!${RST}" || \
-    echo -e "  ${YLW}Skipped (VexFS logs printed to FUSE daemon output)${RST}"
+    echo -e "  ${YLW}Skipped${RST}"
 
 section "Live Search Demo"
 echo "benchmark performance test" > "$VEXFS_MNT/test_doc.txt" 2>/dev/null || true
 echo "authentication login credentials" > "$VEXFS_MNT/auth.txt" 2>/dev/null || true
 sleep 0.2
-
-echo "authentication" > "$VEXFS_MNT/.vexfs-search" 2>/dev/null && {
-    echo -e "  ${GRN}Search results:${RST}"
-    cat "$VEXFS_MNT/.vexfs-search" 2>/dev/null | head -10 | sed 's/^/  /'
-} || echo -e "  ${YLW}Search query filed (VexFS returns results via cat)${RST}"
+echo "authentication" > "$VEXFS_MNT/.vexfs-search" 2>/dev/null || true
+sleep 0.3
+echo -e "  ${GRN}Search results:${RST}"
+cat "$VEXFS_MNT/.vexfs-search" 2>/dev/null | head -10 | sed 's/^/  /' || \
+    echo -e "  ${YLW}(search query filed — cat .vexfs-search to read results)${RST}"
 
 section "Filesystem Stats"
 df -h "$VEXFS_MNT" 2>/dev/null | sed 's/^/  /' || true
@@ -163,6 +218,5 @@ df -h "$VEXFS_MNT" 2>/dev/null | sed 's/^/  /' || true
 echo ""
 echo -e "${GRN}${BOLD}  ✓ Benchmark complete.${RST}"
 echo ""
-echo -e "  Run again with a custom mountpoint:"
-echo -e "    ${BLU}./bench.sh ~/mnt/vexfs ~/vexfs.img${RST}"
+echo -e "  Re-run:  ${BLU}./bench.sh ~/mnt/vexfs ~/vexfs.img${RST}"
 echo ""
