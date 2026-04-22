@@ -32,6 +32,8 @@ pub struct SearchIndex {
     files: HashMap<u64, IndexedFile>,
     // word -> how many files contain it (for IDF)
     doc_freq: HashMap<String, usize>,
+    pub last_query_result: Vec<u8>,
+    pub last_ask_result: Vec<u8>,
 }
 
 impl SearchIndex {
@@ -39,6 +41,8 @@ impl SearchIndex {
         Self {
             files: HashMap::new(),
             doc_freq: HashMap::new(),
+            last_query_result: Vec::new(),
+            last_ask_result: Vec::new(),
         }
     }
 

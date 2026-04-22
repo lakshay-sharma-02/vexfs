@@ -1,0 +1,151 @@
+   Compiling blake3 v1.8.4
+    Checking vexfs v0.1.0 (/mnt/c/Users/sharm/Desktop/vexfs-main)
+error[E0428]: the name `snapshot_disk` is defined multiple times
+   --> src/fs/mod.rs:317:1
+    |
+  7 |...pshot_disk;
+    |...----------- previous definition of the module `snapshot_disk` here
+...
+317 |...apshot_disk {
+    |...^^^^^^^^^^^ `snapshot_disk` redefined here
+    |
+    = note: `snapshot_disk` must be defined only once in the type namespace of this module
+
+warning: unused import: `super::disk::SnapshotRaw as DiskSnapshot`
+   --> src/fs/mod.rs:318:13
+    |
+318 | ...se super...pshot;
+    |       ^^^^^...^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `MAX_SNAPSHOT_SLOTS as MAX_SNAPSHOTS`, `SNAPSHOT_RECORD_SIZE`, and `SNAPSHOT_TABLE_OFFSET`
+   --> src/fs/mod.rs:319:21
+    |
+319 | ...::{MAX_SNAPSHOT_...NAPSHOT_RECORD_SIZE, SNAPSHOT_TABLE_OFFSET};
+    |       ^^^^^^^^^^^^^...^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `flush` found for struct `File` in the current scope
+    --> src/fs/mod.rs:140:14
+     |
+ 140 | ...le.flush()....
+     |       ^^^^^ method not found in `File`
+     |
+    ::: /home/lakshay/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/io/mod.rs:1841:8
+     |
+1841 | ...fn flush(&m...
+     |       ----- the method is available for `File` here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: trait `Write` which provides `flush` is implemented but not in scope; perhaps you want to import it
+     |
+   4 + use std::io::Write;
+     |
+
+error[E0599]: no method named `flush` found for struct `File` in the current scope
+    --> src/fs/mod.rs:276:19
+     |
+ 276 | ...le.flush()....
+     |       ^^^^^ method not found in `File`
+     |
+    ::: /home/lakshay/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/io/mod.rs:1841:8
+     |
+1841 | ...fn flush(&m...
+     |       ----- the method is available for `File` here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: trait `Write` which provides `flush` is implemented but not in scope; perhaps you want to import it
+     |
+   4 + use std::io::Write;
+     |
+
+error[E0061]: this method takes 1 argument but 0 arguments were supplied
+   --> src/fuse/mod.rs:170:27
+    |
+170 | ...ap.is_valid() { ...
+    |       ^^^^^^^^-- argument #1 of type `u64` is missing
+    |
+note: method defined here
+   --> src/fs/disk.rs:331:12
+    |
+331 | ...fn is_valid(&self, magic: u64) -...
+    |       ^^^^^^^^        ----------
+help: provide the argument
+    |
+170 |             if !disk_snap.is_valid(/* u64 */) { continue; }
+    |                                    +++++++++
+
+error[E0308]: mismatched types
+   --> src/fuse/mod.rs:834:68
+    |
+834 | ...sk.write_snapshot(slot, &disk_snap);
+    |       --------------       ^^^^^^^^^^ expecte...SnapshotRaw`, found `&DiskSnapshot`
+    |       |
+    |       arguments to this method are incorrect
+    |
+    = note: expected reference `&SnapshotRaw`
+               found reference `&DiskSnapshot`
+note: method defined here
+   --> src/fs/mod.rs:221:12
+    |
+221 | ...fn writ...apshot(&mut self, index: usize, snap...hotRaw) -...
+    |       ^^^^...^^^^^^                          ----...------
+
+error[E0499]: cannot borrow `p` as mutable more than once at a time
+   --> src/ai/neural.rs:305:27
+    |
+298 | ...et mut get_u64 = || ->...<u64> {
+    |                     -----...----- first mutable borrow occurs here
+...
+302 | ...   p += 8;
+    |       - first borrow occurs due to use of `p` in closure
+...
+305 | ...et mut get_u32 = || ->...<u32> {
+    |                     ^^^^^...^^^^^ second mutable borrow occurs here
+...
+309 | ...   p += 4;
+    |       - second borrow occurs due to use of `p` in closure
+...
+326 | ...et total_accesses = get_u64()?;
+    |                        ------- first borrow later used here
+
+error[E0499]: cannot borrow `p` as mutable more than once at a time
+   --> src/ai/neural.rs:312:27
+    |
+298 | ...et mut get_u64 = || ->...<u64> {
+    |                     -----...----- first mutable borrow occurs here
+...
+302 | ...   p += 8;
+    |       - first borrow occurs due to use of `p` in closure
+...
+312 | ...et mut get_f32 = || ->...<f32> {
+    |                     ^^^^^...^^^^^ second mutable borrow occurs here
+...
+316 | ...   p += 4;
+    |       - second borrow occurs due to use of `p` in closure
+...
+326 | ...et total_accesses = get_u64()?;
+    |                        ------- first borrow later used here
+
+error[E0499]: cannot borrow `p` as mutable more than once at a time
+   --> src/ai/neural.rs:319:30
+    |
+298 | ...et mut get_u64 = || ->...<u64> {
+    |                     -----...----- first mutable borrow occurs here
+...
+302 | ...   p += 8;
+    |       - first borrow occurs due to use of `p` in closure
+...
+319 | ...et mut get_string = |len:...ring> {
+    |                        ^^^^^...^^^^^ second mutable borrow occurs here
+...
+322 | ...   p += len;
+    |       - second borrow occurs due to use of `p` in closure
+...
+326 | ...et total_accesses = get_u64()?;
+    |                        ------- first borrow later used here
+
+Some errors have detailed explanations: E0061, E0308, E0428, E0499, E0599.
+For more information about an error, try `rustc --explain E0061`.
+warning: `vexfs` (lib) generated 2 warnings
+error: could not compile `vexfs` (lib) due to 8 previous errors; 2 warnings emitted

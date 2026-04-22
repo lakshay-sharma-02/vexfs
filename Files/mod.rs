@@ -4,12 +4,13 @@
 pub mod btree;
 pub mod buffer;
 pub mod snapshot;
+pub mod snapshot_disk;
 pub mod disk;
 pub mod journal;
 pub mod free_list;
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use disk::{

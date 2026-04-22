@@ -73,7 +73,7 @@ impl ThreatLevel {
 #[derive(Debug, Clone)]
 struct WriteRecord {
     timestamp: u64,
-    entropy: f64,
+    _entropy: f64,
 }
 
 /// Guards the filesystem against ransomware-like write patterns.
@@ -161,7 +161,7 @@ impl EntropyGuard {
             // Evict expired records
             records.retain(|r| now.saturating_sub(r.timestamp) <= self.window_secs);
 
-            records.push(WriteRecord { timestamp: now, entropy });
+            records.push(WriteRecord { timestamp: now, _entropy: entropy });
 
             // 4. Pattern detection: N high-entropy writes in window
             if records.len() >= self.pattern_count {

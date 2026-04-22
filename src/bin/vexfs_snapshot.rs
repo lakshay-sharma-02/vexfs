@@ -1,7 +1,7 @@
 //! vexfs-snapshot — snapshot CLI for VexFS
 
 use vexfs::fs::DiskManager;
-use vexfs::fs::snapshot_disk::MAX_SNAPSHOTS;
+use vexfs::fs::snapshot_disk::{MAX_SNAPSHOTS, SNAPSHOT_MAGIC};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,7 @@ fn cmd_all(image: &str) {
             Ok(s) => s,
             Err(_) => break,
         };
-        if !s.is_valid() { continue; }
+        if !s.is_valid(SNAPSHOT_MAGIC) { continue; }
         let name = s.get_name();
         if name.is_empty() { continue; }
         snaps.push((s.id, name, s.size, s.timestamp, s.ino));
@@ -95,7 +95,7 @@ fn cmd_list(image: &str, filename: &str) {
             Ok(s) => s,
             Err(_) => break,
         };
-        if !s.is_valid() { continue; }
+        if !s.is_valid(SNAPSHOT_MAGIC) { continue; }
         let name = s.get_name();
         if name != filename { continue; }
         snaps.push((s.id, s.size, s.timestamp));
@@ -129,7 +129,7 @@ fn cmd_restore(image: &str, filename: &str, version: u32) {
             Ok(s) => s,
             Err(_) => break,
         };
-        if !s.is_valid() { continue; }
+        if !s.is_valid(SNAPSHOT_MAGIC) { continue; }
         if s.get_name() != filename { continue; }
         if s.id != version { continue; }
         snap_data_offset = s.data_offset;

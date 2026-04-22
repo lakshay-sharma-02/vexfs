@@ -167,7 +167,7 @@ impl VexFS {
                 Ok(s) => s,
                 Err(_) => break,
             };
-            if !disk_snap.is_valid() { continue; }
+            if !disk_snap.is_valid(SNAPSHOT_MAGIC) { continue; }
             let name = disk_snap.get_name();
             if name.is_empty() { continue; }
 

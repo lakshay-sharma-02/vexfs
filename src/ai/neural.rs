@@ -252,6 +252,124 @@ impl NeuralPrefetcher {
             self.accuracy() * 100.0,
         )
     }
+
+    /// Serialize state to bytes (for persistence)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Total accesses & correct predictions
+        out.extend_from_slice(&self.total_accesses.to_le_bytes());
+        out.extend_from_slice(&self.correct_predictions.to_le_bytes());
+
+        // Vocab
+        let vocab_len: u32 = self.idx_to_ino.len() as u32;
+        out.extend_from_slice(&vocab_len.to_le_bytes());
+        for i in 0..self.idx_to_ino.len() {
+            out.extend_from_slice(&self.idx_to_ino[i].to_le_bytes());
+            let name_bytes = self.idx_to_name[i].as_bytes();
+            let n_len = name_bytes.len() as u32;
+            out.extend_from_slice(&n_len.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+        }
+
+        // Layer 1 weights (HIDDEN_SIZE x INPUT_SIZE) + biases
+        for i in 0..HIDDEN_SIZE {
+            for j in 0..INPUT_SIZE {
+                out.extend_from_slice(&self.w1[i][j].to_le_bytes());
+            }
+            out.extend_from_slice(&self.b1[i].to_le_bytes());
+        }
+
+        // Layer 2 weights (vocab x HIDDEN_SIZE) + biases
+        for i in 0..self.idx_to_ino.len() {
+            for j in 0..HIDDEN_SIZE {
+                out.extend_from_slice(&self.w2[i][j].to_le_bytes());
+            }
+            out.extend_from_slice(&self.b2[i].to_le_bytes());
+        }
+
+        out
+    }
+
+    /// Deserialize state from bytes (for persistence)
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 16 { return None; }
+        let mut p = 0;
+        
+        let get_u64 = |p: &mut usize| -> Option<u64> {
+            if *p + 8 > data.len() { return None; }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[*p..*p+8]);
+            *p += 8;
+            Some(u64::from_le_bytes(b))
+        };
+        let get_u32 = |p: &mut usize| -> Option<u32> {
+            if *p + 4 > data.len() { return None; }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&data[*p..*p+4]);
+            *p += 4;
+            Some(u32::from_le_bytes(b))
+        };
+        let get_f32 = |p: &mut usize| -> Option<f32> {
+            if *p + 4 > data.len() { return None; }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&data[*p..*p+4]);
+            *p += 4;
+            Some(f32::from_le_bytes(b))
+        };
+        let get_string = |p: &mut usize, len: usize| -> Option<String> {
+            if *p + len > data.len() { return None; }
+            let s = String::from_utf8_lossy(&data[*p..*p+len]).to_string();
+            *p += len;
+            Some(s)
+        };
+
+        let total_accesses = get_u64(&mut p)?;
+        let correct_predictions = get_u64(&mut p)?;
+        let vocab_len = get_u32(&mut p)?;
+
+        let mut idx_to_ino = Vec::with_capacity(vocab_len as usize);
+        let mut idx_to_name = Vec::with_capacity(vocab_len as usize);
+        let mut ino_to_idx = HashMap::new();
+
+        for i in 0..vocab_len {
+            let ino = get_u64(&mut p)?;
+            let n_len = get_u32(&mut p)?;
+            let name = get_string(&mut p, n_len as usize)?;
+            idx_to_ino.push(ino);
+            idx_to_name.push(name);
+            ino_to_idx.insert(ino, i as usize);
+        }
+
+        let mut w1 = vec![[0f32; INPUT_SIZE]; HIDDEN_SIZE];
+        let mut b1 = vec![0f32; HIDDEN_SIZE];
+
+        for i in 0..HIDDEN_SIZE {
+            for j in 0..INPUT_SIZE {
+                w1[i][j] = get_f32(&mut p)?;
+            }
+            b1[i] = get_f32(&mut p)?;
+        }
+
+        let mut w2 = vec![vec![0f32; HIDDEN_SIZE]; vocab_len as usize];
+        let mut b2 = vec![0f32; vocab_len as usize];
+
+        for i in 0..vocab_len as usize {
+            for j in 0..HIDDEN_SIZE {
+                w2[i][j] = get_f32(&mut p)?;
+            }
+            b2[i] = get_f32(&mut p)?;
+        }
+
+        Some(Self {
+            w1, b1, w2, b2,
+            ino_to_idx,
+            idx_to_ino,
+            idx_to_name,
+            history: VecDeque::with_capacity(INPUT_SIZE + 1),
+            total_accesses,
+            correct_predictions,
+        })
+    }
 }
 
 #[cfg(test)]
