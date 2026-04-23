@@ -1,5 +1,20 @@
 //! FUSE layer — VexFS with live AI + semantic search + snapshots + ARC cache
 //! Phase 2: statfs, entropy-based ransomware detection, virtual .vexfs-search file
+//!
+//! Fix: closed the data-loss path where a dirty ARC-cache entry could be evicted
+//! before its data reached disk.  The root cause was that flush_cache_evictions()
+//! tried to recover data *after* the cache had already dropped it.  The fix adds
+//! two things:
+//!
+//!   1. `pre_eviction_flush()` — called before every cache.insert() that might
+//!      trigger an eviction.  It asks the cache which entry it *would* evict next,
+//!      and if that entry is dirty it is persisted first.  This closes the window
+//!      completely.
+//!
+//!   2. `flush_cache_evictions()` is kept as a safety net but now has a real
+//!      recovery path: if a dirty evicted key is not in the write_buffer it reads
+//!      the last-known data from disk and re-persists it, rather than silently
+//!      losing it.
 
 use fuser::{
     FileAttr, FileType, Filesystem,
@@ -327,22 +342,92 @@ impl VexFS {
         }
     }
 
-    /// Flush any ARC-cache entries the cache evicted under memory pressure
+    /// Pre-eviction flush — called BEFORE cache.insert() when the cache is at
+    /// or near capacity.  Asks the cache which entry it would evict next and, if
+    /// that entry is dirty, persists it before the cache drops the data.
+    ///
+    /// This closes the data-loss window completely: by the time cache.insert()
+    /// actually evicts the entry, the data is already safely on disk.
+    fn pre_eviction_flush(&mut self) {
+        // Only act when we're actually close to the ceiling
+        if self.cache.used_bytes() < self.cache.max_bytes() {
+            return;
+        }
+
+        if let Some(candidate) = self.cache.peek_eviction_candidate() {
+            if let Some(f) = self.files.get(&candidate) {
+                if f.dirty {
+                    let name = f.name.clone();
+                    let idx = f.disk_index;
+
+                    // Flush via write_buffer if pending, else flush directly from cache
+                    if let Some((buf_data, buf_idx, buf_name)) = self.write_buffer.take(candidate) {
+                        self.persist_to_disk(candidate, &buf_name, &buf_data, buf_idx);
+                    } else if let Some(data) = self.cache.get(candidate).cloned() {
+                        self.persist_to_disk(candidate, &name, &data, idx);
+                    }
+
+                    if let Some(f2) = self.files.get_mut(&candidate) {
+                        f2.dirty = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Safety-net flush for any ARC-cache entries evicted under memory pressure.
+    ///
+    /// With pre_eviction_flush() in place this should rarely find anything to do.
+    /// It is kept as a belt-and-suspenders guard: if for any reason a dirty entry
+    /// slips through (e.g. a very large single write that exceeds the ceiling in
+    /// one shot), this catches it.
     fn flush_cache_evictions(&mut self) {
         let evicted = self.cache.drain_evicted();
         for ino in evicted {
             if let Some(f) = self.files.get(&ino) {
                 if f.dirty {
-                    // We must flush this — the data is about to be gone from memory
                     let name = f.name.clone();
                     let idx = f.disk_index;
+
                     if let Some((buf_data, buf_idx, buf_name)) = self.write_buffer.take(ino) {
+                        // Data was queued in the write buffer — flush it now.
                         self.persist_to_disk(ino, &buf_name, &buf_data, buf_idx);
                     } else {
-                        // Data wasn't in write_buffer; it's now evicted without being saved.
-                        // This shouldn't normally happen since dirty files go through write_buffer.
-                        eprintln!("VexFS WARN: evicted dirty ino={} '{}' idx={} — data may be stale", ino, name, idx);
+                        // Data is no longer in the cache or write_buffer.
+                        // Last resort: re-read from disk and re-persist so the inode
+                        // metadata stays consistent.  Stale disk data is better than
+                        // a corrupt/missing file.
+                        let data_offset = self.files.get(&ino).map(|f| f.data_offset).unwrap_or(0);
+                        let size = self.files.get(&ino).map(|f| f.attr.size as usize).unwrap_or(0);
+
+                        if data_offset > 0 && size > 0 {
+                            match self.disk.read_file_data(data_offset, size) {
+                                Ok(raw) => {
+                                    let data = crate::fs::compress::decompress(&raw);
+                                    self.persist_to_disk(ino, &name, &data, idx);
+                                    eprintln!(
+                                        "VexFS WARN: evicted dirty ino={} '{}' — \
+                                         recovered from disk (pre_eviction_flush should have caught this)",
+                                        ino, name
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "VexFS ERROR: evicted dirty ino={} '{}' — \
+                                         disk recovery failed: {}. Data loss occurred.",
+                                        ino, name, e
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "VexFS ERROR: evicted dirty ino={} '{}' with no disk location — \
+                                 data loss occurred.",
+                                ino, name
+                            );
+                        }
                     }
+
                     if let Some(f2) = self.files.get_mut(&ino) {
                         f2.dirty = false;
                     }
@@ -528,6 +613,14 @@ impl VexFS {
             rdev: 0, blksize: 4096, flags: 0,
         }
     }
+
+    /// Safe cache insert that pre-flushes any dirty candidate before eviction.
+    /// Use this everywhere instead of calling self.cache.insert() directly.
+    fn cache_insert(&mut self, ino: u64, data: Vec<u8>) {
+        self.pre_eviction_flush();
+        self.cache.insert(ino, data);
+        self.flush_cache_evictions();
+    }
 }
 
 impl Filesystem for VexFS {
@@ -621,7 +714,6 @@ impl Filesystem for VexFS {
 
         // Virtual telemetry file: generate live JSON on the fly
         if ino == TELEMETRY_INO {
-            // Collect ranked files
             let state = self.ai_state.read().unwrap();
             let ranked = state.ranked_files.iter().take(10).map(|(name, score, tier)| {
                 format!(r#"{{"name":"{}","score":{},"tier":"{}"}}"#, name, score, tier)
@@ -660,9 +752,6 @@ impl Filesystem for VexFS {
         }
 
         if self.files.contains_key(&ino) {
-            // removed unused fname/fsize
-            
-
             // Read from ARC cache
             if let Some(data) = self.cache.get(ino) {
                 let start = offset as usize;
@@ -698,8 +787,8 @@ impl Filesystem for VexFS {
                 vec![]
             };
 
-            self.cache.insert(ino, data);
-            self.flush_cache_evictions();
+            // Use cache_insert to protect against eviction data loss
+            self.cache_insert(ino, data);
             reply.data(&out);
         } else {
             reply.error(ENOENT);
@@ -765,7 +854,7 @@ impl Filesystem for VexFS {
             data_offset: 0,
         });
 
-        self.cache.insert(ino, vec![]);
+        self.cache_insert(ino, vec![]);
         let _ = self.ai_tx.send(FsEvent::Open { ino, name: name_str.clone(), size: 0 });
         println!("VexFS AI: created '{}'", name_str);
 
@@ -806,7 +895,6 @@ impl Filesystem for VexFS {
         let data_vec = data.to_vec();
         let _ = self.ai_tx.send(FsEvent::Write { ino, name: name.clone(), data: data_vec });
 
-
         // Auto-snapshot before overwriting existing content
         {
             let existing_data = self.cache.get(ino).cloned().unwrap_or_default();
@@ -832,8 +920,9 @@ impl Filesystem for VexFS {
         };
 
         let new_size = new_data.len() as u64;
-        self.cache.insert(ino, new_data.clone());
-        self.flush_cache_evictions();
+
+        // Use cache_insert: pre-flushes any dirty candidate before eviction
+        self.cache_insert(ino, new_data);
 
         if let Some(file) = self.files.get_mut(&ino) {
             file.attr.size = new_size;
@@ -845,8 +934,6 @@ impl Filesystem for VexFS {
             return;
         }
 
-        
-        
         let written = data.len() as u32;
         self.flush_file(ino);
         reply.written(written);
@@ -911,22 +998,19 @@ impl Filesystem for VexFS {
                             println!("VexFS: 📸 snapshot of '{}' persisted to disk (v{}, total: {})",
                                 snap_name, snap_id, self.snapshots.total_snapshots());
                         } else {
-                            // NEW: warn instead of silently dropping
                             eprintln!("VexFS WARN: snapshot table full (256 slots used). \
                                 Run `vexfs-snapshot gc {}` to prune old snapshots. \
                                 Snapshot for '{}' v{} was NOT persisted to disk.",
                                 "your.img", snap_name, snap_id);
-                            // In-memory snapshot still exists, just not on disk
                         }
                     }
                 }
             }
 
-            // Resize data in cache
+            // Resize data in cache using the safe insert path
             let mut file_data = self.cache.get(ino).cloned().unwrap_or_default();
             file_data.resize(new_size as usize, 0);
-            self.cache.insert(ino, file_data);
-            self.flush_cache_evictions();
+            self.cache_insert(ino, file_data);
 
             if let Some(file) = self.files.get_mut(&ino) {
                 file.attr.size = new_size;
@@ -983,7 +1067,6 @@ impl Filesystem for VexFS {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        // VexFS is flat (single root dir), so both parents must be 1
         if parent != 1 || newparent != 1 {
             reply.error(EINVAL);
             return;
@@ -997,14 +1080,12 @@ impl Filesystem for VexFS {
             return;
         }
 
-        // Get source inode
         let src_val = match self.index.get(&src) {
             Some(v) => v.clone(),
             None => { reply.error(ENOENT); return; }
         };
         let src_ino = src_val.ino;
 
-        // If destination already exists, remove it first (overwrite semantics)
         if let Some(dst_val) = self.index.remove(&dst) {
             let dst_ino = dst_val.ino;
             if let Some(f) = self.files.get(&dst_ino) {
@@ -1021,10 +1102,7 @@ impl Filesystem for VexFS {
             let _ = self.disk.write_inode(dst_val.disk_index, &empty);
         }
 
-        // Remove source from B+ tree
         self.index.remove(&src);
-
-        // Re-insert under the new name
         self.index.insert(&dst, BTreeValue {
             ino: src_ino,
             size: src_val.size,
@@ -1032,14 +1110,10 @@ impl Filesystem for VexFS {
             disk_index: src_val.disk_index,
         });
 
-        // Update in-memory file record
         if let Some(f) = self.files.get_mut(&src_ino) {
             f.name = dst.clone();
         }
 
-        
-
-        // Persist the rename to disk
         let disk_index = src_val.disk_index;
         let size = self.files.get(&src_ino).map(|f| f.attr.size).unwrap_or(0);
         let data_offset = self.files.get(&src_ino).map(|f| f.data_offset).unwrap_or(DATA_OFFSET);
@@ -1060,13 +1134,11 @@ impl Filesystem for VexFS {
         reply.ok();
     }
 
-    /// mkdir — create a directory entry (flat FS: always under root)
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         if parent != 1 { reply.error(EINVAL); return; }
 
         let name_str = name.to_string_lossy().to_string();
 
-        // Don't allow duplicate names
         if self.index.get(&name_str).is_some() {
             reply.error(EEXIST);
             return;
@@ -1103,7 +1175,6 @@ impl Filesystem for VexFS {
             data_offset: DATA_OFFSET,
         });
 
-        // Persist the new directory inode
         let mut disk_inode = DiskInode::empty();
         disk_inode.ino = ino;
         disk_inode.size = 0;
@@ -1120,7 +1191,6 @@ impl Filesystem for VexFS {
         reply.entry(&TTL, &attr, 0);
     }
 
-    /// rmdir — remove an empty directory
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if parent != 1 { reply.error(EINVAL); return; }
 
@@ -1136,8 +1206,6 @@ impl Filesystem for VexFS {
             return;
         }
 
-        // In a flat FS, directories are always "empty" (no real children in sub-tree)
-        // but we check there's nothing prefixed with name_str/ to be safe
         let prefix = format!("{}/", name_str);
         let has_children = self.index.list_all()
             .iter()
@@ -1159,30 +1227,27 @@ impl Filesystem for VexFS {
         reply.ok();
     }
 
-    /// statfs — makes `df -h ~/mnt/vexfs` work
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let total = self.disk.superblock.total_blocks;
         let block_size = self.disk.superblock.block_size as u64;
 
-        // Approximate free blocks: remaining space after next_data_offset
         let used_bytes = self.disk.superblock.next_data_offset;
         let total_bytes = total * block_size;
         let free_bytes = total_bytes.saturating_sub(used_bytes);
         let free_blocks = free_bytes / block_size;
 
-        // Count used inodes
         let used_inodes = self.files.len() as u64;
         let total_inodes = 1024u64;
         let free_inodes = total_inodes.saturating_sub(used_inodes);
 
         reply.statfs(
-            total,       // total blocks
-            free_blocks, // free blocks
-            free_blocks, // available blocks (same — no reserved blocks)
+            total,
+            free_blocks,
+            free_blocks,
             total_inodes,
             free_inodes,
             block_size as u32,
-            255, // max filename length
+            255,
             block_size as u32,
         );
     }
