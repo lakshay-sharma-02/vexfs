@@ -1,7 +1,8 @@
 //! vexfs-snapshot — snapshot CLI for VexFS
 
 use vexfs::fs::DiskManager;
-use vexfs::fs::snapshot_disk::{MAX_SNAPSHOTS, SNAPSHOT_MAGIC};
+use vexfs::fs::MAX_SNAPSHOT_SLOTS as MAX_SNAPSHOTS;
+const SNAPSHOT_MAGIC: u64 = 0x534E415000000001;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
