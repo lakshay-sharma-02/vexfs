@@ -14,12 +14,13 @@
 //!   Search    — writes to .vexfs-search virtual file, reads result
 //!   Ask       — writes to .vexfs-ask virtual file, reads LLM answer
 //!   Snapshots — lists + restores snapshots via subprocess
+//!
 
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2, Ui, ScrollArea};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -471,7 +472,7 @@ impl VexApp {
         ui.separator();
 
         ScrollArea::vertical()
-            .id_source("file_list")
+            .id_salt("file_list")
             .max_height(ui.available_height() - 40.0)
             .show(ui, |ui| {
                 if files.is_empty() {
@@ -507,6 +508,8 @@ impl VexApp {
                                 { let _ = Command::new("xdg-open").arg(&full).spawn(); }
                                 #[cfg(target_os = "macos")]
                                 { let _ = Command::new("open").arg(&full).spawn(); }
+                                #[cfg(target_os = "windows")]
+                                { let _ = Command::new("explorer").arg(&full).spawn(); }
                             }
                             if name_label.hovered() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -653,7 +656,7 @@ impl VexApp {
             );
         } else {
             ScrollArea::vertical()
-                .id_source("ranked")
+                .id_salt("ranked")
                 .max_height(200.0)
                 .show(ui, |ui| {
                     egui::Grid::new("ranked_grid")
@@ -780,7 +783,7 @@ impl VexApp {
         ui.add_space(8.0);
 
         ScrollArea::vertical()
-            .id_source("search_result")
+            .id_salt("search_result")
             .show(ui, |ui| {
                 if self.search_result.is_empty() {
                     ui.label(
@@ -842,7 +845,7 @@ impl VexApp {
         ui.add_space(8.0);
 
         ScrollArea::vertical()
-            .id_source("ask_result")
+            .id_salt("ask_result")
             .show(ui, |ui| {
                 if self.ask_result.is_empty() {
                     ui.label(
@@ -908,7 +911,7 @@ impl VexApp {
         }
 
         ScrollArea::vertical()
-            .id_source("snap_list")
+            .id_salt("snap_list")
             .show(ui, |ui| {
                 egui::Grid::new("snap_grid")
                     .num_columns(4)
@@ -1009,7 +1012,7 @@ impl eframe::App for VexApp {
 // ── Helper widgets ────────────────────────────────────────────────────────────
 
 fn stat_card(ui: &mut Ui, label: &str, value: &str, color: Color32) {
-    egui::Frame::none()
+    egui::Frame::default()
         .fill(Color32::from_gray(28))
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
@@ -1132,7 +1135,7 @@ fn main() {
         "VexFS Explorer",
         options,
         Box::new(move |_cc| {
-            Box::new(VexApp::new(mountpoint, image_path, daemon_url)) as Box<dyn eframe::App>
+            Ok(Box::new(VexApp::new(mountpoint, image_path, daemon_url)))
         }),
     ).unwrap();
 }

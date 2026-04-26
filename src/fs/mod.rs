@@ -285,6 +285,22 @@ impl DiskManager {
         None
     }
 
+    /// Alias for find_free_slot to match FUSE expectation.
+    pub fn alloc_inode(&mut self) -> Option<usize> {
+        self.find_free_slot()
+    }
+
+    /// Mark an inode as free on disk.
+    pub fn free_inode(&mut self, index: usize) -> DiskResult<()> {
+        let mut inode = self.read_inode(index)?;
+        inode.is_used = 0;
+        self.write_inode(index, &inode)
+    }
+
+    pub fn free_block_count(&self) -> DiskResult<u64> {
+        Ok(self.superblock.free_blocks)
+    }
+
     pub fn find_free_snapshot_slot(&mut self) -> Option<usize> {
         for i in 0..MAX_SNAPSHOT_SLOTS {
             if let Ok(snap) = self.read_snapshot(i) {
@@ -343,7 +359,17 @@ impl DiskManager {
     }
 }
 
+// ── Backward-compatibility re-exports (used by existing bins) ────────────────
 
+pub mod snapshot_disk {
+    pub use super::disk::SnapshotRaw as DiskSnapshot;
+    pub use super::{
+        MAX_SNAPSHOT_SLOTS as MAX_SNAPSHOTS,
+        SNAPSHOT_RECORD_SIZE,
+        SNAPSHOT_TABLE_OFFSET,
+    };
+    pub const SNAPSHOT_MAGIC: u64 = 0x534E415000000001;
+}
 
 #[cfg(test)]
 mod tests {

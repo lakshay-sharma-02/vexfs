@@ -6,3 +6,5 @@ pub mod persist;
 pub mod entropy;
 pub mod neural;
 pub mod engine;
+pub mod memory;
+pub mod memory_persist;
