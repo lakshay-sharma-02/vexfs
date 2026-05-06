@@ -547,6 +547,15 @@ impl MemoryEngine {
             co_access_pairs: self.co_access.pairs.len(),
         }
     }
+
+    pub fn stats_map(&self) -> HashMap<u64, (String, u32, u64, u64)> {
+        self.names.iter().map(|(&ino, name)| {
+            let opens = self.temporal.get(&ino).map(|p| p.total).unwrap_or(0);
+            let last  = self.streaks.get(&ino).map(|s| s.last_touched_day * 86400).unwrap_or(0);
+            let eng   = opens as u64; // Fallback for engagement since MemoryEngine doesn't track it
+            (ino, (name.clone(), opens, last, eng))
+        }).collect()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -67,7 +67,8 @@ A FUSE-based AI-augmented filesystem written in Rust. Mountable, persistent, rea
 - **Importance scorer** — recency(40%) + frequency(40%) + engagement(20%) → 0.0-1.0 → HOT(≥0.6)/WARM(≥0.3)/COLD, evicts lowest-scored when at 10,000 file cap
 - **TF-IDF search** — indexes file content + names, handles natural language queries, stopword filtering, partial filename matching, last query/ask results stored in `SearchIndex`
 - **Entropy guard** — Shannon entropy per write, threshold_warn=7.2, threshold_crit=7.8, pattern detection (3 writes in 60s window), suspicious extension list (`.locked`, `.enc`, `.wncry`, etc.), ignores writes <512 bytes
-- **AI engine** — single background thread, `FsEvent` enum (Open/Write/Close/Delete/SearchQuery/AskQuery/SyncCacheSize/SyncAI), write accumulator buffers chunks per inode until Close
+- **Workspace Intelligence** — `WorkspaceModel` clusters projects (Union-Find) and profiles sessions. `JarvisEngine` provides actionable suggestions (stalls, continuity). `MemoryEngine` tracks short/long term trends.
+- **AI engine** — single background thread, `FsEvent` enum (Open/Write/Close/Delete/SearchQuery/AskQuery/SyncCacheSize/SyncAI/EndSession), write accumulator buffers chunks per inode until Close
 - **AI persistence** — blake3 checksummed binary format `VEXAI002`, saves Markov + importance + neural weights. Neural uses separate `.neural` file `VEXNERL1`
 
 ### AI Engine Events (`src/ai/engine.rs`)
@@ -114,6 +115,7 @@ pub struct SharedAIState {
 0xFFFFFFFE  .vexfs-search       write query → read TF-IDF results
 0xFFFFFFFD  .vexfs-telemetry.json  read-only live JSON stats
 0xFFFFFFFC  .vexfs-ask          write natural-language question → read TF-IDF answer
+0xFFFFFFFA  .vexfs-jarvis       read-only workspace intelligence suggestions
 ```
 
 Telemetry JSON fields: `cache_used`, `cache_max`, `markov_entries`, `search_indexed`, `snapshots_total`, `entropy_threats`, `total_files`, `ranked_files[]`

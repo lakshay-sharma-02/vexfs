@@ -12,6 +12,9 @@ pub struct Snapshot {
     pub data_offset: u64,
     pub timestamp: u64,
     pub data: Vec<u8>,
+    /// Which slot in the on-disk snapshot table this came from.
+    /// usize::MAX means "not yet written to disk".
+    pub disk_slot: usize,
 }
 
 impl Snapshot {
@@ -27,6 +30,7 @@ impl Snapshot {
                 .unwrap_or_default()
                 .as_secs(),
             data: data.to_vec(),
+            disk_slot: usize::MAX,
         }
     }
 
@@ -112,6 +116,28 @@ impl SnapshotManager {
         all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)
             .then(b.id.cmp(&a.id))); // break ties by id
         all.into_iter().take(limit).collect()
+    }
+
+    /// GC: keep only the `keep` most recent snapshots per file.
+    /// Returns a list of disk_slot values that should be zeroed on disk.
+    /// Only returns slots that were actually written (disk_slot != usize::MAX).
+    pub fn gc_keep_per_file(&mut self, keep: usize) -> Vec<usize> {
+        let mut freed_slots = Vec::new();
+        for snaps in self.snapshots.values_mut() {
+            if snaps.len() <= keep {
+                continue;
+            }
+            // Sort oldest-first, drop everything beyond `keep` newest
+            snaps.sort_by_key(|s| s.timestamp);
+            let to_remove = snaps.len() - keep;
+            let removed: Vec<Snapshot> = snaps.drain(..to_remove).collect();
+            for s in removed {
+                if s.disk_slot != usize::MAX {
+                    freed_slots.push(s.disk_slot);
+                }
+            }
+        }
+        freed_slots
     }
 }
 

@@ -272,6 +272,14 @@ impl DiskManager {
         }
     }
 
+    /// Zero out a snapshot slot on disk, freeing it for reuse.
+    pub fn zero_snapshot_slot(&mut self, index: usize) -> DiskResult<()> {
+        assert!(index < MAX_SNAPSHOT_SLOTS, "snapshot index out of bounds");
+        let offset = SNAPSHOT_TABLE_OFFSET + (index * SNAPSHOT_RECORD_SIZE) as u64;
+        let zeros = vec![0u8; SNAPSHOT_RECORD_SIZE];
+        write_bytes(&mut self.file, offset, &zeros)
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     pub fn find_free_slot(&mut self) -> Option<usize> {

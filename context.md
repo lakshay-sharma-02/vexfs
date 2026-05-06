@@ -40,10 +40,13 @@ The user (Lakshay) is NOT interested in toys/demos. Each phase must be productio
 - `bench.sh` — automated bash benchmark script (VexFS vs tmpfs)
 - Fixed `mkfs_vexfs` to create image file automatically: `./mkfs_vexfs vexfs.img 128` now works
 
-**Phase 4A (IN PROGRESS — started, not finished):**
-- Goal 1: Neural prefetcher (replace Markov with online-learning neural net in `src/ai/neural.rs`)
-- Goal 2: LLM natural-language query interface via `.vexfs-ask` virtual file
-- Status: neural.rs and fuse/mod.rs wiring PARTIALLY done — see Phase 4A section below
+**Phase 4A (completed):**
+- Neural prefetcher (`src/ai/neural.rs`) alongside Markov
+- LLM natural-language query interface via `.vexfs-ask` virtual file (TF-IDF fallback for now)
+- **Workspace Intelligence (Jarvis):**
+  - `WorkspaceModel` (`src/ai/workspace.rs`): Auto project clustering via Union-Find, session profiling (Focus/Exploration/Debugging).
+  - `JarvisEngine` (`src/ai/jarvis.rs`): Generates actionable suggestions (StallBreaker, Continuity, Neglect, PreWarm).
+  - Virtual `.vexfs-jarvis` file to display insights.
 
 ---
 
@@ -94,7 +97,8 @@ vexfs-main/
 ```rust
 const SEARCH_INO: u64    = 0xFFFFFFFE;  // .vexfs-search    (Phase 2)
 const TELEMETRY_INO: u64 = 0xFFFFFFFD;  // .vexfs-telemetry.json (Phase 3)
-const ASK_INO: u64       = 0xFFFFFFFC;  // .vexfs-ask        (Phase 4A - ADD THIS)
+const ASK_INO: u64       = 0xFFFFFFFC;  // .vexfs-ask        (Phase 4A)
+const JARVIS_INO: u64    = 0xFFFFFFFA;  // .vexfs-jarvis     (Phase 4A)
 ```
 
 ---

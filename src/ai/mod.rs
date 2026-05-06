@@ -8,3 +8,5 @@ pub mod neural;
 pub mod engine;
 pub mod memory;
 pub mod memory_persist;
+pub mod workspace;
+pub mod jarvis;

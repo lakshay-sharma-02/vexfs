@@ -10,6 +10,9 @@ use super::entropy::{EntropyGuard, ThreatLevel};
 use super::search::SearchIndex;
 use super::logger::{AccessLog, AccessEvent, AccessKind};
 use super::memory::MemoryEngine;
+use super::workspace::WorkspaceModel;
+use super::jarvis::JarvisEngine;
+use std::collections::HashSet;
 
 pub enum FsEvent {
     Open   { ino: u64, name: String, size: u64 },
@@ -52,6 +55,8 @@ pub struct SharedAIState {
     pub memory_active_streaks:  usize,
     pub memory_trending_count:  usize,
     pub memory_co_access_pairs: usize,
+    /// Rendered .vexfs-jarvis content — updated at EndSession
+    pub jarvis_result: Vec<u8>,
 }
 
 pub struct AIEngine {
@@ -65,6 +70,14 @@ pub struct AIEngine {
 
     last_opened_ino:   Option<u64>,
     write_accumulator: HashMap<u64, Vec<u8>>,
+    workspace: WorkspaceModel,
+    /// Inodes touched in the current session (for WorkspaceModel)
+    session_files: Vec<u64>,
+    /// Per-inode write counts this session
+    session_writes: HashMap<u64, u32>,
+    /// Per-inode open counts this session
+    session_opens: HashMap<u64, u32>,
+    workspace_rendered: Vec<u8>,
 }
 
 impl AIEngine {
@@ -82,6 +95,11 @@ impl AIEngine {
             search, log, memory,
             last_opened_ino: None,
             write_accumulator: HashMap::new(),
+            workspace: WorkspaceModel::new(),
+            session_files: Vec::new(),
+            session_writes: HashMap::new(),
+            session_opens: HashMap::new(),
+            workspace_rendered: Vec::new(),
         }
     }
 
@@ -156,6 +174,12 @@ impl AIEngine {
                 let trend = self.memory.trends.trend(ino);
                 println!("VexFS AI: '{}' score={:.2} [{}] {}",
                     name, score, tier.label(), trend.label());
+
+                // Track for WorkspaceModel
+                if !self.session_files.contains(&ino) {
+                    self.session_files.push(ino);
+                }
+                *self.session_opens.entry(ino).or_insert(0) += 1;
             }
 
             // ── Write ─────────────────────────────────────────────────────
@@ -200,6 +224,9 @@ impl AIEngine {
 
                 // Memory: count the write
                 self.memory.record_write(ino);
+
+                // Track for WorkspaceModel
+                *self.session_writes.entry(ino).or_insert(0) += 1;
             }
 
             // ── Close ─────────────────────────────────────────────────────
@@ -254,6 +281,55 @@ impl AIEngine {
                     "VexFS Memory: session closed. Total: {} sessions, {} files tracked",
                     stats.total_sessions, stats.tracked_files
                 );
+
+                // Recompute WorkspaceModel
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Build co_access map from memory co-access pairs
+                let co_access: HashMap<(u64, u64), u32> = self.memory.co_access
+                    .pairs
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect();
+
+                self.workspace.recompute(
+                    &co_access,
+                    &self.memory.stats_map(),   // HashMap<u64, (String, u32, u64, u64)>
+                    &self.session_writes,
+                    &self.session_opens,
+                    &self.memory.names,
+                    &self.session_files.clone(),
+                    now_ts,
+                );
+
+                // Generate Jarvis suggestions
+                let suggestions = JarvisEngine::analyse(&self.workspace);
+                let rendered    = JarvisEngine::render(&suggestions, &self.workspace);
+
+                println!(
+                    "VexFS Jarvis: {} suggestion(s) ready — read .vexfs-jarvis",
+                    suggestions.len()
+                );
+                if !suggestions.is_empty() {
+                    // Print top suggestion to console so user sees it on unmount
+                    let top = &suggestions[0];
+                    println!(
+                        "  {} {} — {}",
+                        top.priority.label(), top.kind.label(), top.message
+                    );
+                }
+
+                // Store rendered output for the virtual file
+                // sync_state will pick this up
+                self.workspace_rendered = rendered.into_bytes();
+
+                // Reset session tracking for next session
+                self.session_files.clear();
+                self.session_writes.clear();
+                self.session_opens.clear();
             }
 
             // ── SyncAI / SyncCacheSize ────────────────────────────────────
@@ -349,5 +425,6 @@ impl AIEngine {
         w.context_result = self.memory
             .context_summary(&self.memory.names.clone())
             .into_bytes();
+        w.jarvis_result = self.workspace_rendered.clone();
     }
 }

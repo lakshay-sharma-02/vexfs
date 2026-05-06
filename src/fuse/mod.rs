@@ -68,7 +68,17 @@ const CONTEXT_INO: u64 = 0xFFFFFFFB;
 /// Name of the virtual context file
 const CONTEXT_FILENAME: &str = ".vexfs-context";
 
+/// Reserved inode number for the virtual jarvis file
+const JARVIS_INO: u64 = 0xFFFFFFFA;
+/// Name of the virtual jarvis file
+const JARVIS_FILENAME: &str = ".vexfs-jarvis";
+
 const TTL: Duration = Duration::from_secs(1);
+
+/// Trigger auto-GC when this many snapshot slots are in use.
+const SNAPSHOT_GC_THRESHOLD: usize = 200;
+/// Keep this many snapshots per file after GC.
+const SNAPSHOT_GC_KEEP: usize = 3;
 
 /// In-memory file metadata (no data — data lives in the ARC cache)
 struct VexFile {
@@ -216,6 +226,7 @@ impl VexFS {
                     data_offset: disk_snap.data_offset,
                     timestamp: disk_snap.timestamp,
                     data,
+                    disk_slot: i,
                 });
             snap_count += 1;
         }
@@ -653,6 +664,37 @@ impl VexFS {
         }
     }
 
+    fn jarvis_file_attr(&self) -> FileAttr {
+        let size = self.ai_state.read().unwrap().jarvis_result.len() as u64;
+        FileAttr {
+            ino: JARVIS_INO, size, blocks: 1,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o444, nlink: 1, uid: 1000, gid: 1000,
+            rdev: 0, blksize: 4096, flags: 0,
+        }
+    }
+
+    /// If the snapshot table is getting full, drop old snapshots and zero
+    /// their disk slots. Called after every new snapshot is taken.
+    fn maybe_gc_snapshots(&mut self) {
+        if self.snapshots.total_snapshots() < SNAPSHOT_GC_THRESHOLD {
+            return;
+        }
+        let freed = self.snapshots.gc_keep_per_file(SNAPSHOT_GC_KEEP);
+        let count = freed.len();
+        for slot in freed {
+            if let Err(e) = self.disk.zero_snapshot_slot(slot) {
+                eprintln!("VexFS snapshot GC: failed to zero slot {}: {}", slot, e);
+            }
+        }
+        println!(
+            "VexFS snapshot GC: freed {} slots (threshold={}, keep={} per file)",
+            count, SNAPSHOT_GC_THRESHOLD, SNAPSHOT_GC_KEEP
+        );
+    }
+
     /// Safe cache insert that pre-flushes any dirty candidate before eviction.
     fn cache_insert(&mut self, ino: u64, data: Vec<u8>) {
         self.pre_eviction_flush();
@@ -675,6 +717,7 @@ impl Filesystem for VexFS {
             TELEMETRY_FILENAME => { reply.entry(&TTL, &self.telemetry_file_attr(), 0); return; }
             ASK_FILENAME      => { reply.entry(&TTL, &self.ask_file_attr(),      0); return; }
             CONTEXT_FILENAME  => { reply.entry(&TTL, &self.context_file_attr(),  0); return; }
+            JARVIS_FILENAME   => { reply.entry(&TTL, &self.jarvis_file_attr(),   0); return; }
             _ => {}
         }
 
@@ -699,6 +742,7 @@ impl Filesystem for VexFS {
             TELEMETRY_INO  => { reply.attr(&TTL, &self.telemetry_file_attr()); return; }
             ASK_INO        => { reply.attr(&TTL, &self.ask_file_attr());       return; }
             CONTEXT_INO    => { reply.attr(&TTL, &self.context_file_attr());   return; }
+            JARVIS_INO     => { reply.attr(&TTL, &self.jarvis_file_attr());    return; }
             _ => {}
         }
         if let Some(file) = self.files.get(&ino) {
@@ -712,6 +756,15 @@ impl Filesystem for VexFS {
         // Virtual .vexfs-context: live context summary from MemoryEngine
         if ino == CONTEXT_INO {
             let data = self.ai_state.read().unwrap().context_result.clone();
+            let start = offset as usize;
+            let end   = (start + size as usize).min(data.len());
+            reply.data(if start < data.len() { &data[start..end] } else { &[] });
+            return;
+        }
+
+        // Virtual .vexfs-jarvis: AI suggestions and workspace intelligence
+        if ino == JARVIS_INO {
+            let data = self.ai_state.read().unwrap().jarvis_result.clone();
             let start = offset as usize;
             let end   = (start + size as usize).min(data.len());
             reply.data(if start < data.len() { &data[start..end] } else { &[] });
@@ -844,6 +897,33 @@ impl Filesystem for VexFS {
             let mut file_data = self.cache.get(ino).cloned().unwrap_or_default();
 
             let offset = offset as usize;
+            if offset == 0 && !file_data.is_empty() {
+                let name = file.name.clone();
+                let old_offset = file.data_offset;
+                self.snapshots.snapshot(ino, &name, &file_data, old_offset);
+                
+                if let Some(slot) = self.disk.find_free_snapshot_slot() {
+                    let snap_id = self.snapshots.snapshots.get(&ino).and_then(|v| v.last()).map(|s| s.id).unwrap_or(1);
+                    let mut disk_snap = crate::fs::DiskSnapshot::empty();
+                    disk_snap.magic = SNAPSHOT_MAGIC;
+                    disk_snap.ino = ino;
+                    disk_snap.size = file_data.len() as u64;
+                    disk_snap.data_offset = old_offset;
+                    disk_snap.timestamp = Self::now_secs();
+                    disk_snap.id = snap_id;
+                    disk_snap.is_used = 1;
+                    disk_snap.set_name(&name);
+                    let _ = self.disk.write_snapshot(slot, &disk_snap);
+                    
+                    if let Some(snaps) = self.snapshots.snapshots.get_mut(&ino) {
+                        if let Some(s) = snaps.last_mut() {
+                            s.disk_slot = slot;
+                        }
+                    }
+                }
+                self.maybe_gc_snapshots();
+            }
+
             if offset + data.len() > file_data.len() {
                 file_data.resize(offset + data.len(), 0);
             }
@@ -891,6 +971,7 @@ impl Filesystem for VexFS {
             (TELEMETRY_INO, FileType::RegularFile, TELEMETRY_FILENAME),
             (ASK_INO,       FileType::RegularFile, ASK_FILENAME),
             (CONTEXT_INO,   FileType::RegularFile, CONTEXT_FILENAME),
+            (JARVIS_INO,    FileType::RegularFile, JARVIS_FILENAME),
         ];
 
         for file in self.files.values() {
@@ -1069,10 +1150,36 @@ impl Filesystem for VexFS {
         if let Some(file) = self.files.get_mut(&ino) {
             if let Some(s) = size {
                 if s != file.attr.size {
+                    let old_data = self.cache.get(ino).cloned().unwrap_or_default();
+                    let old_offset = file.data_offset;
+                    let name = file.name.clone();
+
+                    self.snapshots.snapshot(ino, &name, &old_data, old_offset);
+                    if let Some(slot) = self.disk.find_free_snapshot_slot() {
+                        let snap_id = self.snapshots.snapshots.get(&ino).and_then(|v| v.last()).map(|s| s.id).unwrap_or(1);
+                        let mut disk_snap = crate::fs::DiskSnapshot::empty();
+                        disk_snap.magic = SNAPSHOT_MAGIC;
+                        disk_snap.ino = ino;
+                        disk_snap.size = old_data.len() as u64;
+                        disk_snap.data_offset = old_offset;
+                        disk_snap.timestamp = Self::now_secs();
+                        disk_snap.id = snap_id;
+                        disk_snap.is_used = 1;
+                        disk_snap.set_name(&name);
+                        let _ = self.disk.write_snapshot(slot, &disk_snap);
+
+                        if let Some(snaps) = self.snapshots.snapshots.get_mut(&ino) {
+                            if let Some(s) = snaps.last_mut() {
+                                s.disk_slot = slot;
+                            }
+                        }
+                    }
+                    self.maybe_gc_snapshots();
+
                     file.attr.size = s;
                     file.dirty = true;
                     // Prepare cache update
-                    let mut data = self.cache.get(ino).cloned().unwrap_or_default();
+                    let mut data = old_data;
                     data.resize(s as usize, 0);
                     cache_to_update = Some(data);
                 }
