@@ -3,277 +3,497 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VexFS Telemetry Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <title>VexFS Explorer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #0b0c10;
-            --panel-bg: rgba(31, 33, 44, 0.6);
-            --border-color: rgba(255, 255, 255, 0.1);
+            --bg: #0b0c10;
+            --surface: rgba(31, 33, 44, 0.6);
+            --surface2: rgba(45, 48, 60, 0.8);
+            --border: rgba(255, 255, 255, 0.08);
             --primary: #45f3ff;
-            --critical: #ff2a55;
-            --text-main: #e0e6ed;
-            --text-muted: #8b9bb4;
+            --primary-hover: #1ae5f3;
+            --danger: #ff2a55;
+            --warning: #ff9f0a;
+            --success: #00ff88;
+            --text: #e0e6ed;
+            --muted: #8b9bb4;
+            --hot: #ff453a;
+            --warm: #ff9f0a;
+            --cold: #64d2ff;
         }
+
+        * { box-sizing: border-box; }
 
         body {
-            background-color: var(--bg-color);
-            color: var(--text-main);
+            background-color: var(--bg);
+            color: var(--text);
             font-family: 'Inter', sans-serif;
             margin: 0;
-            padding: 2rem;
-            min-height: 100vh;
-            background-image: radial-gradient(circle at 50% 0%, rgba(69, 243, 255, 0.1) 0%, transparent 60%);
-        }
-
-        .dashboard {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-
-        .header {
+            height: 100vh;
             display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid var(--border-color);
+            flex-direction: column;
+            overflow: hidden;
+            background-image: radial-gradient(circle at 50% 0%, rgba(69, 243, 255, 0.05) 0%, transparent 60%);
         }
 
-        .header h1 {
-            margin: 0;
-            font-weight: 700;
-            letter-spacing: -0.5px;
+        /* Topbar */
+        .topbar {
+            height: 60px;
             display: flex;
             align-items: center;
-            gap: 10px;
+            padding: 0 24px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(11, 12, 16, 0.8);
+            backdrop-filter: blur(12px);
+            z-index: 100;
         }
-
-        .header h1 i {
-            color: var(--primary);
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .card {
-            background: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            transition: transform 0.2s ease, border-color 0.2s ease;
-        }
-        
-        .card:hover {
-            transform: translateY(-2px);
-            border-color: rgba(69, 243, 255, 0.3);
-        }
-
-        .card h3 {
-            margin: 0 0 1rem 0;
+        .logo { font-weight: 700; font-size: 1.1rem; display: flex; align-items: center; gap: 10px; color: var(--primary); margin-right: 40px; }
+        .tabs { display: flex; gap: 8px; }
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: var(--muted);
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            font-weight: 500;
             font-size: 0.9rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: var(--text-muted);
+            transition: all 0.2s;
             display: flex;
             align-items: center;
             gap: 8px;
         }
+        .tab-btn:hover { color: var(--text); background: var(--surface); }
+        .tab-btn.active { color: #fff; background: var(--primary); box-shadow: 0 0 15px rgba(69, 243, 255, 0.3); }
+        .status { margin-left: auto; font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
 
-        .stat-value {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin: 0;
+        /* Main Area */
+        .main { flex: 1; display: flex; overflow: hidden; position: relative; }
+        .view {
+            position: absolute; inset: 0; padding: 24px; overflow-y: auto;
+            opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
         }
+        .view.active { opacity: 1; pointer-events: auto; }
+
+        /* Buttons */
+        .btn {
+            background: var(--surface2); color: var(--text);
+            border: 1px solid var(--border); border-radius: 6px;
+            padding: 6px 12px; cursor: pointer; font-size: 0.85rem; font-weight: 500;
+            transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px;
+        }
+        .btn:hover { background: rgba(255,255,255,0.1); }
+        .btn.primary { background: var(--primary); color: #000; border-color: var(--primary); }
+        .btn.primary:hover { background: var(--primary-hover); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(69,243,255,0.2); }
+        .btn.danger { background: rgba(255, 42, 85, 0.1); color: var(--danger); border-color: rgba(255,42,85,0.2); }
+        .btn.danger:hover { background: var(--danger); color: #fff; }
+
+        /* Cards & Glassmorphism */
+        .glass-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+
+        /* Files View */
+        .toolbar { display: flex; justify-content: space-between; margin-bottom: 20px; }
+        .file-list { display: flex; flex-direction: column; gap: 8px; }
+        .file-row {
+            display: flex; align-items: center; padding: 12px 16px;
+            background: rgba(255,255,255,0.02); border: 1px solid transparent;
+            border-radius: 8px; transition: all 0.2s;
+        }
+        .file-row:hover { background: var(--surface); border-color: var(--border); }
+        .f-icon { width: 30px; color: var(--muted); }
+        .f-name { flex: 1; font-weight: 500; color: var(--text); cursor: pointer; }
+        .f-name:hover { color: var(--primary); }
+        .f-size { width: 100px; color: var(--muted); font-size: 0.85rem; }
+        .f-actions { display: flex; gap: 8px; opacity: 0; transition: opacity 0.2s; }
+        .file-row:hover .f-actions { opacity: 1; }
+
+        /* Editor */
+        .editor-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+        .editor-title { font-weight: 600; font-size: 1.2rem; flex: 1; }
+        textarea {
+            width: 100%; height: calc(100vh - 200px);
+            background: var(--bg); color: #a5b4fc;
+            border: 1px solid var(--border); border-radius: 8px;
+            padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 14px;
+            resize: none; outline: none; line-height: 1.5;
+        }
+        textarea:focus { border-color: var(--primary); }
+
+        /* Dialog */
+        .overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5); backdrop-filter: blur(4px);
+            display: none; justify-content: center; align-items: center; z-index: 1000;
+        }
+        .overlay.active { display: flex; }
+        .dialog { width: 400px; }
+        .input-group { margin-bottom: 16px; }
+        .input-group label { display: block; margin-bottom: 8px; color: var(--muted); font-size: 0.9rem; }
+        .input-group input {
+            width: 100%; background: var(--bg); border: 1px solid var(--border);
+            color: var(--text); padding: 10px; border-radius: 6px; outline: none;
+        }
+        .input-group input:focus { border-color: var(--primary); }
         
-        .stat-label {
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            margin-top: 5px;
+        /* Dashboard Stats */
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stat-val { font-size: 2rem; font-weight: 700; margin: 10px 0; }
+        .stat-lbl { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
+
+        /* Input views (Search/Ask) */
+        .big-input {
+            width: 100%; background: var(--surface); border: 1px solid var(--border);
+            color: var(--text); padding: 16px 24px; border-radius: 12px; font-size: 1.1rem; outline: none;
+            margin-bottom: 24px; transition: border-color 0.2s;
+        }
+        .big-input:focus { border-color: var(--primary); }
+        .result-box {
+            background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+            padding: 24px; min-height: 200px; white-space: pre-wrap; font-family: 'Inter', sans-serif;
+            color: var(--muted); line-height: 1.6;
         }
 
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: rgba(255,255,255,0.1);
-            border-radius: 4px;
-            margin-top: 15px;
-            overflow: hidden;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--primary), #00ff88);
-            border-radius: 4px;
-            transition: width 0.3s ease;
-        }
-
-        .threat-alert {
-            animation: pulse-border 2s infinite;
-        }
-        
-        .threat-alert .stat-value {
-            color: var(--critical);
-        }
-
-        .tier-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-
-        .tier-list li {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px 0;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
-        }
-        
-        .tier-list li:last-child {
-            border-bottom: none;
-        }
-
-        .tier-badge {
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-
-        .tier-hot { background: rgba(255, 69, 58, 0.2); color: #ff453a; }
-        .tier-warm { background: rgba(255, 159, 10, 0.2); color: #ff9f0a; }
-        .tier-cold { background: rgba(100, 210, 255, 0.2); color: #64d2ff; }
-
-        @keyframes pulse-border {
-            0% { box-shadow: 0 0 0 0 rgba(255, 42, 85, 0.4); border-color: rgba(255, 42, 85, 0.6); }
-            70% { box-shadow: 0 0 0 10px rgba(255, 42, 85, 0); border-color: rgba(255, 42, 85, 0.1); }
-            100% { box-shadow: 0 0 0 0 rgba(255, 42, 85, 0); }
-        }
+        /* Badges */
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+        .badge.hot { background: rgba(255, 69, 58, 0.2); color: var(--hot); }
+        .badge.warm { background: rgba(255, 159, 10, 0.2); color: var(--warm); }
+        .badge.cold { background: rgba(100, 210, 255, 0.2); color: var(--cold); }
     </style>
 </head>
 <body>
-    <div class="dashboard">
-        <div class="header">
-            <h1><i class="fa-solid fa-microchip"></i> VexFS UI</h1>
-            <div id="status-indicator" style="color: #00ff88;"><i class="fa-solid fa-circle-dot"></i> Live</div>
+
+    <div class="topbar">
+        <div class="logo"><i class="fa-solid fa-microchip"></i> VexFS</div>
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('files')"><i class="fa-regular fa-folder"></i> Files</button>
+            <button class="tab-btn" onclick="switchTab('dashboard')"><i class="fa-solid fa-chart-line"></i> Dashboard</button>
+            <button class="tab-btn" onclick="switchTab('search')"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+            <button class="tab-btn" onclick="switchTab('ask')"><i class="fa-solid fa-robot"></i> Ask AI</button>
         </div>
-
-        <div class="grid">
-            <div class="card">
-                <h3><i class="fa-solid fa-database"></i> ARC Cache</h3>
-                <div class="stat-value" id="cache-used">0 MB</div>
-                <div class="stat-label">of <span id="cache-max">0</span> MB total</div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="cache-progress" style="width: 0%"></div>
-                </div>
-            </div>
-
-            <div class="card" id="threat-card">
-                <h3><i class="fa-solid fa-shield-halved"></i> Entropy Guard</h3>
-                <div class="stat-value" id="threats-count">0</div>
-                <div class="stat-label">Ransomware threats blocked</div>
-            </div>
-            
-            <div class="card">
-                <h3><i class="fa-solid fa-brain"></i> AI Metrics</h3>
-                <div style="display: flex; justify-content: space-between; margin-top: 10px;">
-                    <div>
-                        <div class="stat-value" id="markov-count" style="font-size: 1.8rem">0</div>
-                        <div class="stat-label">Markov Entries</div>
-                    </div>
-                    <div>
-                        <div class="stat-value" id="search-count" style="font-size: 1.8rem">0</div>
-                        <div class="stat-label">Indexed Files</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card" style="margin-bottom: 2rem;">
-            <h3><i class="fa-solid fa-fire"></i> Importance Tier List</h3>
-            <ul class="tier-list" id="tier-list">
-                <!-- Dynamically populated -->
-                <li><span style="color: var(--text-muted)">Awaiting telemetry...</span></li>
-            </ul>
+        <div class="status">
+            <div class="dot" id="conn-dot"></div> <span id="conn-status">Connected</span>
         </div>
     </div>
 
+    <div class="main">
+        <!-- FILES VIEW -->
+        <div id="view-files" class="view active">
+            <div class="toolbar">
+                <div style="font-size: 1.2rem; font-weight: 600;">Filesystem</div>
+                <button class="btn primary" onclick="showNewFileDialog()"><i class="fa-solid fa-plus"></i> New File</button>
+            </div>
+            <div class="file-list" id="file-list">
+                <div style="color: var(--muted); padding: 20px;">Loading files...</div>
+            </div>
+        </div>
+
+        <!-- EDITOR VIEW -->
+        <div id="view-editor" class="view">
+            <div class="editor-header">
+                <button class="btn" onclick="switchTab('files')"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                <div class="editor-title" id="editor-filename">filename.txt</div>
+                <div id="editor-status" style="color: var(--muted); font-size: 0.9rem; margin-right: 16px;"></div>
+                <button class="btn primary" onclick="saveFile()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+            </div>
+            <textarea id="editor-content" oninput="document.getElementById('editor-status').innerText='Unsaved changes'"></textarea>
+        </div>
+
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="view">
+            <div style="font-size: 1.2rem; font-weight: 600; margin-bottom: 24px;">Telemetry Dashboard</div>
+            <div class="grid">
+                <div class="glass-card">
+                    <div class="stat-lbl">ARC Cache</div>
+                    <div class="stat-val" id="dash-cache">0 MB</div>
+                </div>
+                <div class="glass-card">
+                    <div class="stat-lbl">AI Models</div>
+                    <div class="stat-val" id="dash-markov">0</div>
+                </div>
+                <div class="glass-card">
+                    <div class="stat-lbl">Indexed Search</div>
+                    <div class="stat-val" id="dash-search">0</div>
+                </div>
+                <div class="glass-card">
+                    <div class="stat-lbl">Entropy Guard</div>
+                    <div class="stat-val" id="dash-threats" style="color: var(--danger)">0</div>
+                </div>
+            </div>
+            <div class="glass-card">
+                <div class="stat-lbl" style="margin-bottom: 16px;">AI Tier Rankings</div>
+                <div class="file-list" id="dash-tiers"></div>
+            </div>
+        </div>
+
+        <!-- SEARCH VIEW -->
+        <div id="view-search" class="view">
+            <div style="max-width: 800px; margin: 0 auto; padding-top: 40px;">
+                <h2 style="margin-top: 0;">Semantic Search</h2>
+                <p style="color: var(--muted); margin-bottom: 24px;">Instant TF-IDF search across all VexFS contents.</p>
+                <input type="text" id="search-input" class="big-input" placeholder="e.g. authentication configuration..." onkeydown="if(event.key==='Enter') doSearch()">
+                <div class="result-box" id="search-result">Results will appear here.</div>
+            </div>
+        </div>
+
+        <!-- ASK AI VIEW -->
+        <div id="view-ask" class="view">
+            <div style="max-width: 800px; margin: 0 auto; padding-top: 40px;">
+                <h2 style="margin-top: 0;">Workspace Intelligence</h2>
+                <p style="color: var(--muted); margin-bottom: 24px;">Ask questions about your files, architecture, and current context.</p>
+                <input type="text" id="ask-input" class="big-input" placeholder="e.g. summarize the authentication logic..." onkeydown="if(event.key==='Enter') doAsk()">
+                <div class="result-box" id="ask-result">AI response will appear here.</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW FILE DIALOG -->
+    <div class="overlay" id="dialog-new-file">
+        <div class="glass-card dialog">
+            <h3 style="margin-top: 0;">Create New File</h3>
+            <div class="input-group">
+                <label>Filename</label>
+                <input type="text" id="new-filename" placeholder="e.g. config.json">
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px;">
+                <button class="btn" onclick="closeDialogs()">Cancel</button>
+                <button class="btn primary" onclick="createFile()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- SCRIPT -->
     <script>
-        function formatSize(bytes) {
-            if (bytes === 0) return '0 MB';
-            const k = 1024;
-            const mb = bytes / (k * k);
-            return mb.toFixed(1) + ' MB';
-        }
-
-        async function updateTelemetry() {
-            try {
-                const response = await fetch('/api/telemetry');
-                if (!response.ok) throw new Error('API unavailable');
-                const data = await response.json();
-
-                document.getElementById('status-indicator').style.color = '#00ff88';
-
-                // Update Cache
-                document.getElementById('cache-used').innerText = formatSize(data.cache_used);
-                document.getElementById('cache-max').innerText = (data.cache_max / (1024*1024)).toFixed(0);
-                const cachePct = Math.min(100, Math.max(0, (data.cache_used / data.cache_max) * 100));
-                document.getElementById('cache-progress').style.width = cachePct + '%';
-
-                // Update Threats
-                const threatsCount = document.getElementById('threats-count');
-                const threatCard = document.getElementById('threat-card');
-                if (data.entropy_threats > 0) {
-                    threatCard.classList.add('threat-alert');
-                } else {
-                    threatCard.classList.remove('threat-alert');
-                }
-                threatsCount.innerText = data.entropy_threats;
-
-                // Update AI stats
-                document.getElementById('markov-count').innerText = data.markov_entries;
-                document.getElementById('search-count').innerText = data.search_indexed;
-
-                // Update Tiers
-                const tierList = document.getElementById('tier-list');
-                tierList.innerHTML = '';
-                if (data.ranked_files && data.ranked_files.length > 0) {
-                    data.ranked_files.forEach(file => {
-                        const li = document.createElement('li');
-                        let tierClass = 'tier-cold';
-                        if (file.tier === 'HOT') tierClass = 'tier-hot';
-                        if (file.tier === 'WARM') tierClass = 'tier-warm';
-                        
-                        li.innerHTML = `
-                            <span><i class="fa-regular fa-file"></i> &nbsp; ${file.name}</span>
-                            <div>
-                                <span style="color: var(--text-muted); font-size: 0.8rem; margin-right: 15px;">Score: ${file.score.toFixed(2)}</span>
-                                <span class="tier-badge ${tierClass}">${file.tier}</span>
-                            </div>
-                        `;
-                        tierList.appendChild(li);
-                    });
-                } else {
-                    tierList.innerHTML = '<li><span style="color: var(--text-muted)">No files indexed yet</span></li>';
-                }
-
-            } catch (err) {
-                console.error(err);
-                document.getElementById('status-indicator').style.color = 'var(--text-muted)';
+        // Tab switching
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            
+            const btnIndex = ['files', 'dashboard', 'search', 'ask'].indexOf(tabId);
+            if (btnIndex >= 0) document.querySelectorAll('.tab-btn')[btnIndex].classList.add('active');
+            
+            if (tabId === 'files' || tabId === 'editor') {
+                if (tabId === 'files') loadFiles();
+                document.getElementById('view-' + tabId).classList.add('active');
+                if(tabId !== 'editor') document.querySelectorAll('.tab-btn')[0].classList.add('active');
+            } else {
+                document.getElementById('view-' + tabId).classList.add('active');
             }
         }
 
-        // Poll every 1 second
-        setInterval(updateTelemetry, 1000);
+        // Format bytes
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        // API calls
+        async function loadFiles() {
+            try {
+                const res = await fetch('/api/files');
+                const files = await res.json();
+                
+                const list = document.getElementById('file-list');
+                list.innerHTML = '';
+                
+                if (files.length === 0) {
+                    list.innerHTML = '<div style="color: var(--muted); padding: 20px;">No files found.</div>';
+                    return;
+                }
+
+                files.forEach(f => {
+                    const row = document.createElement('div');
+                    row.className = 'file-row';
+                    
+                    const icon = f.is_dir ? 'fa-folder' : (f.is_text ? 'fa-file-lines' : 'fa-file');
+                    const color = f.is_text ? '#a5b4fc' : 'var(--text)';
+                    
+                    row.innerHTML = `
+                        <div class="f-icon"><i class="fa-solid ${icon}"></i></div>
+                        <div class="f-name" style="color: ${color}" onclick="openFile('${f.name}')">${f.name}</div>
+                        <div class="f-size">${formatBytes(f.size)}</div>
+                        <div class="f-actions">
+                            <button class="btn" onclick="askAbout('${f.name}')">Ask AI</button>
+                            <button class="btn danger" onclick="deleteFile('${f.name}')"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                    `;
+                    list.appendChild(row);
+                });
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function openFile(name) {
+            try {
+                const res = await fetch('/api/file/' + encodeURIComponent(name));
+                const data = await res.json();
+                
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                
+                document.getElementById('editor-filename').innerText = name;
+                document.getElementById('editor-content').value = data.content;
+                document.getElementById('editor-status').innerText = '';
+                switchTab('editor');
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function saveFile() {
+            const name = document.getElementById('editor-filename').innerText;
+            const content = document.getElementById('editor-content').value;
+            
+            try {
+                const res = await fetch('/api/file/' + encodeURIComponent(name), {
+                    method: 'POST',
+                    body: content
+                });
+                if (res.ok) {
+                    document.getElementById('editor-status').innerText = '✓ Saved';
+                    document.getElementById('editor-status').style.color = 'var(--success)';
+                    setTimeout(() => { document.getElementById('editor-status').style.color = 'var(--muted)'; }, 2000);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function deleteFile(name) {
+            if (!confirm(`Delete ${name}?`)) return;
+            try {
+                await fetch('/api/file/' + encodeURIComponent(name), { method: 'DELETE' });
+                loadFiles();
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        // New File Dialog
+        function showNewFileDialog() {
+            document.getElementById('new-filename').value = '';
+            document.getElementById('dialog-new-file').classList.add('active');
+            document.getElementById('new-filename').focus();
+        }
+        function closeDialogs() {
+            document.querySelectorAll('.overlay').forEach(el => el.classList.remove('active'));
+        }
+        async function createFile() {
+            const name = document.getElementById('new-filename').value.trim();
+            if (!name) return;
+            try {
+                await fetch('/api/file/' + encodeURIComponent(name), { method: 'POST', body: '' });
+                closeDialogs();
+                openFile(name);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        // AI & Search
+        async function doSearch() {
+            const input = document.getElementById('search-input').value.trim();
+            if(!input) return;
+            
+            const resBox = document.getElementById('search-result');
+            resBox.innerText = 'Searching...';
+            resBox.style.color = 'var(--text)';
+            
+            try {
+                const res = await fetch('/api/search', { method: 'POST', body: input });
+                const data = await res.json();
+                resBox.innerText = data.result || 'No results.';
+            } catch (e) {
+                resBox.innerText = 'Error executing search.';
+            }
+        }
+
+        async function doAsk() {
+            const input = document.getElementById('ask-input').value.trim();
+            if(!input) return;
+            
+            const resBox = document.getElementById('ask-result');
+            resBox.innerText = 'Thinking...';
+            resBox.style.color = 'var(--text)';
+            
+            try {
+                const res = await fetch('/api/ask', { method: 'POST', body: input });
+                const data = await res.json();
+                resBox.innerText = data.result || 'No answer generated.';
+            } catch (e) {
+                resBox.innerText = 'Error reaching AI engine.';
+            }
+        }
+
+        function askAbout(name) {
+            document.getElementById('ask-input').value = `Summarize and explain the file: ${name}`;
+            switchTab('ask');
+            doAsk();
+        }
+
+        // Telemetry Polling
+        async function updateTelemetry() {
+            try {
+                const res = await fetch('/api/telemetry');
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                
+                document.getElementById('conn-dot').style.background = 'var(--success)';
+                document.getElementById('conn-status').innerText = 'Connected';
+                
+                document.getElementById('dash-cache').innerText = (data.cache_used / (1024*1024)).toFixed(1) + ' MB';
+                document.getElementById('dash-markov').innerText = data.markov_entries || 0;
+                document.getElementById('dash-search').innerText = data.search_indexed || 0;
+                document.getElementById('dash-threats').innerText = data.entropy_threats || 0;
+                
+                // Tiers
+                const tierList = document.getElementById('dash-tiers');
+                if (document.getElementById('view-dashboard').classList.contains('active')) {
+                    tierList.innerHTML = '';
+                    if (data.ranked_files && data.ranked_files.length > 0) {
+                        data.ranked_files.forEach(f => {
+                            const row = document.createElement('div');
+                            row.className = 'file-row';
+                            row.style.padding = '8px 12px';
+                            
+                            let bClass = 'cold';
+                            if(f.tier === 'HOT') bClass = 'hot';
+                            if(f.tier === 'WARM') bClass = 'warm';
+                            
+                            row.innerHTML = `
+                                <div class="badge ${bClass}" style="width: 50px; text-align: center;">${f.tier}</div>
+                                <div class="f-name" style="margin-left: 12px;">${f.name}</div>
+                                <div style="color: var(--muted); font-size: 0.85rem;">Score: ${f.score.toFixed(2)}</div>
+                            `;
+                            tierList.appendChild(row);
+                        });
+                    } else {
+                        tierList.innerHTML = '<div style="color: var(--muted); padding: 12px;">Awaiting telemetry...</div>';
+                    }
+                }
+            } catch (e) {
+                document.getElementById('conn-dot').style.background = 'var(--danger)';
+                document.getElementById('conn-status').innerText = 'Offline';
+            }
+        }
+
+        // Init
+        loadFiles();
+        setInterval(updateTelemetry, 2000);
         updateTelemetry();
     </script>
 </body>

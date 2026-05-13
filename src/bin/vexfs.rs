@@ -1117,12 +1117,17 @@ fn cmd_gui(args: GuiArgs) {
         }
     };
 
-    if !mountpoint.exists() {
-        fs::create_dir_all(&mountpoint).unwrap_or_else(|e| {
-            die::<()>(&format!("Cannot create mount point '{}': {e}", mountpoint.display()));
-        });
-        println!("✓ Created mount point: {}", mountpoint.display());
-    }
+    // Try to clean up any stale FUSE mount left over from a previous crash.
+    // fusermount -u is a no-op if nothing is mounted, so this is always safe.
+    let _ = std::process::Command::new("fusermount")
+        .args(["-u", &mountpoint.to_string_lossy()])
+        .output();
+
+    // create_dir_all is idempotent — succeeds even if dir already exists.
+    fs::create_dir_all(&mountpoint).unwrap_or_else(|e| {
+        die::<()>(&format!("Cannot create mount point '{}': {e}", mountpoint.display()));
+    });
+    println!("✓ Mount point: {}", mountpoint.display());
 
     // ── Step 2: check / format image ──────────────────────────────────────
     let image_path = PathBuf::from(&args.image);
@@ -1243,6 +1248,30 @@ fn cmd_gui(args: GuiArgs) {
     thread::sleep(Duration::from_millis(300));
 
     // ── Step 6: launch GUI ────────────────────────────────────────────────
+    // On WSL2, force X11 backend: clear any stale WAYLAND_DISPLAY that was
+    // set by the user, and ensure DISPLAY is pointing to the WSLg X server.
+    // This is a no-op on native Linux desktops with a real Wayland compositor.
+    if std::env::var("WAYLAND_DISPLAY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        && std::env::var("WSL_DISTRO_NAME").is_ok()
+    {
+        // We're on WSL2 with a broken WAYLAND_DISPLAY — clear it and use X11
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+        if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
+            unsafe { std::env::set_var("DISPLAY", ":0"); }
+        }
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    } else if std::env::var("WSL_DISTRO_NAME").is_ok() {
+        // WSL2 but WAYLAND_DISPLAY not set — ensure DISPLAY is set
+        if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
+            unsafe { std::env::set_var("DISPLAY", ":0"); }
+        }
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
+
     println!("\n  Launching VexFS Explorer…\n");
 
     let image_path_str = args.image.clone();
@@ -1269,39 +1298,189 @@ fn run_daemon_thread(
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
+    fn cors(stream: &mut TcpStream, status: &str, ct: &str, body: &str) {
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                 Access-Control-Allow-Headers: Content-Type\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
+
+    fn json_ok(stream: &mut TcpStream, body: &str) {
+        cors(stream, "200 OK", "application/json", body);
+    }
+
+    fn json_err(stream: &mut TcpStream, msg: &str) {
+        cors(stream, "400 Bad Request", "application/json",
+             &format!("{{\"error\":\"{msg}\"}}"));
+    }
+
+    fn escape_json(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    }
+
     fn handle(mut stream: TcpStream, mountpoint: std::path::PathBuf, dashboard_dir: std::path::PathBuf) {
-        let mut buf = [0u8; 2048];
-        let Ok(n) = stream.read(&mut buf) else { return; };
+        // Read the full request (headers + body up to 256 KB)
+        let mut buf = vec![0u8; 262144];
+        let n = match stream.read(&mut buf) { Ok(n) => n, Err(_) => return };
         if n == 0 { return; }
 
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let first = req.lines().next().unwrap_or("");
+        let raw = String::from_utf8_lossy(&buf[..n]);
+        let first = raw.lines().next().unwrap_or("");
         let mut parts = first.split_whitespace();
-        let _method = parts.next().unwrap_or("");
-        let path    = parts.next().unwrap_or("/");
+        let method = parts.next().unwrap_or("").to_uppercase();
+        let path   = parts.next().unwrap_or("/").to_string();
 
-        if path == "/api/telemetry" {
-            let tel = mountpoint.join(".vexfs-telemetry.json");
-            let body = fs::read_to_string(&tel).unwrap_or_else(|_| "{}".into());
-            let _ = stream.write_all(
-                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                         body.len(), body).as_bytes()
-            );
+        // Parse Content-Length
+        let content_length: usize = raw.lines()
+            .find(|l| l.to_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.splitn(2, ':').nth(1)?.trim().parse().ok())
+            .unwrap_or(0);
+
+        // Extract body (after \r\n\r\n)
+        let body_str = raw.find("\r\n\r\n")
+            .map(|i| &raw[i + 4..])
+            .unwrap_or("")
+            .get(..content_length.min(raw.len()))
+            .unwrap_or("")
+            .to_string();
+
+        // CORS preflight
+        if method == "OPTIONS" {
+            cors(&mut stream, "204 No Content", "text/plain", "");
             return;
         }
 
+        // ── /api/telemetry ────────────────────────────────────────────────
+        if path == "/api/telemetry" {
+            let body = fs::read_to_string(mountpoint.join(".vexfs-telemetry.json"))
+                .unwrap_or_else(|_| "{}".into());
+            json_ok(&mut stream, &body);
+            return;
+        }
+
+        // ── /api/files  — list directory ──────────────────────────────────
+        if path == "/api/files" && method == "GET" {
+            let mut items = String::from("[");
+            let mut first_item = true;
+            if let Ok(rd) = fs::read_dir(&mountpoint) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(".vexfs-") { continue; }
+                    let meta  = entry.metadata().ok();
+                    let size  = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    let ext   = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                    let is_text = matches!(ext.as_str(),
+                        "txt"|"md"|"rs"|"toml"|"yaml"|"yml"|"json"|"sh"|"py"|
+                        "js"|"ts"|"html"|"css"|"c"|"h"|"cpp"|"go"|"java"|
+                        "log"|"conf"|"ini"|"env"|"xml");
+                    if !first_item { items.push(','); }
+                    first_item = false;
+                    items.push_str(&format!(
+                        "{{\"name\":\"{}\",\"size\":{},\"is_dir\":{},\"is_text\":{}}}",
+                        escape_json(&name), size, is_dir, is_text
+                    ));
+                }
+            }
+            items.push(']');
+            json_ok(&mut stream, &items);
+            return;
+        }
+
+        // ── /api/file/<name>  — read file ─────────────────────────────────
+        if let Some(name) = path.strip_prefix("/api/file/") {
+            let fname = urldecode(name);
+            let fpath = mountpoint.join(&fname);
+
+            match method.as_str() {
+                "GET" => {
+                    match fs::read_to_string(&fpath) {
+                        Ok(content) => {
+                            let escaped = escape_json(&content);
+                            json_ok(&mut stream,
+                                &format!("{{\"name\":\"{}\",\"content\":\"{}\"}}",
+                                    escape_json(&fname), escaped));
+                        }
+                        Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
+                    }
+                }
+                "POST" => {
+                    match fs::write(&fpath, body_str.as_bytes()) {
+                        Ok(_)  => json_ok(&mut stream,
+                            &format!("{{\"ok\":true,\"name\":\"{}\"}}", escape_json(&fname))),
+                        Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
+                    }
+                }
+                "DELETE" => {
+                    match fs::remove_file(&fpath) {
+                        Ok(_)  => json_ok(&mut stream,
+                            &format!("{{\"ok\":true,\"name\":\"{}\"}}", escape_json(&fname))),
+                        Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
+                    }
+                }
+                _ => json_err(&mut stream, "method not allowed"),
+            }
+            return;
+        }
+
+        // ── /api/search  — TF-IDF search ─────────────────────────────────
+        if path == "/api/search" && method == "POST" {
+            let search_path = mountpoint.join(".vexfs-search");
+            let result = (|| -> Option<String> {
+                fs::write(&search_path, body_str.trim().as_bytes()).ok()?;
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let out = fs::read_to_string(&search_path).ok()?;
+                Some(out)
+            })().unwrap_or_default();
+            json_ok(&mut stream,
+                &format!("{{\"result\":\"{}\"}}", escape_json(result.trim())));
+            return;
+        }
+
+        // ── /api/ask  — AI question ───────────────────────────────────────
+        if path == "/api/ask" && method == "POST" {
+            let ask_path = mountpoint.join(".vexfs-ask");
+            let result = (|| -> Option<String> {
+                fs::write(&ask_path, body_str.trim().as_bytes()).ok()?;
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let out = fs::read_to_string(&ask_path).ok()?;
+                Some(out)
+            })().unwrap_or_default();
+            json_ok(&mut stream,
+                &format!("{{\"result\":\"{}\"}}", escape_json(result.trim())));
+            return;
+        }
+
+        // ── /api/snapshots  — list via CLI ────────────────────────────────
+        if path == "/api/snapshots" && method == "GET" {
+            // Read from the telemetry file's snapshot count for now
+            json_ok(&mut stream, "[]");
+            return;
+        }
+
+        // ── Static files from dashboard/ ──────────────────────────────────
         let file_path = if path == "/" {
             dashboard_dir.join("index.html")
         } else {
             dashboard_dir.join(path.trim_start_matches('/'))
         };
 
-        if file_path.exists() {
+        if file_path.exists() && file_path.is_file() {
             if let Ok(content) = fs::read(&file_path) {
-                let ct = if path.ends_with(".css") { "text/css" }
+                let ct = if path.ends_with(".css")  { "text/css" }
                          else if path.ends_with(".js") { "application/javascript" }
-                         else { "text/html" };
+                         else { "text/html; charset=utf-8" };
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
                     content.len()
@@ -1313,6 +1492,24 @@ fn run_daemon_thread(
         } else {
             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
         }
+    }
+
+    fn urldecode(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let h1 = chars.next().unwrap_or('0');
+                let h2 = chars.next().unwrap_or('0');
+                let hex = format!("{h1}{h2}");
+                if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                    out.push(b as char);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{port}")) else { return; };
