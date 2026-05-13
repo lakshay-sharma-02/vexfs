@@ -12,7 +12,6 @@ use super::logger::{AccessLog, AccessEvent, AccessKind};
 use super::memory::MemoryEngine;
 use super::workspace::WorkspaceModel;
 use super::jarvis::JarvisEngine;
-use std::collections::HashSet;
 
 pub enum FsEvent {
     Open   { ino: u64, name: String, size: u64 },

@@ -317,6 +317,31 @@ impl Journal {
         self.write_entry(file, &entry)
     }
 
+    /// Append a journal entry for an inode write at a specific disk offset.
+    /// Used for dynamic extension blocks where the offset is not a fixed slot index.
+    pub fn log_inode_write_at(
+        &mut self,
+        file: &mut File,
+        tx_id: u32,
+        disk_offset: u64,
+        inode_bytes: &[u8],
+    ) -> DiskResult<()> {
+        assert!(
+            inode_bytes.len() <= JOURNAL_PAYLOAD_SIZE,
+            "inode_bytes too large for journal payload",
+        );
+
+        let mut entry = JournalEntry::empty();
+        entry.entry_type = ENTRY_WRITE_INODE;
+        entry.state = STATE_WRITTEN;
+        entry.tx_id = tx_id;
+        entry.disk_offset = disk_offset;
+        entry.payload_len = inode_bytes.len() as u32;
+        entry.payload[..inode_bytes.len()].copy_from_slice(inode_bytes);
+
+        self.write_entry(file, &entry)
+    }
+
     /// Append ONE journal entry for a data chunk ≤ JOURNAL_PAYLOAD_SIZE bytes.
     /// For arbitrary-length writes use `log_data_write_all` instead.
     fn log_data_write_chunk(

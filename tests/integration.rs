@@ -26,16 +26,16 @@ impl Drop for MountGuard {
 }
 
 fn mkfs(image: &str, size_mb: u64) {
-    let status = Command::new("./target/debug/mkfs_vexfs")
-        .args([image, &size_mb.to_string()])
+    let status = Command::new("./target/debug/vexfs")
+        .args(["mkfs", image, &size_mb.to_string()])
         .status()
-        .expect("mkfs_vexfs not built — run `cargo build` first");
-    assert!(status.success(), "mkfs_vexfs failed");
+        .expect("vexfs not built — run `cargo build` first");
+    assert!(status.success(), "vexfs mkfs failed");
 }
 
 fn mount(image: &str, mountpoint: &str) -> MountGuard {
     let child = Command::new("./target/debug/vexfs")
-        .args([image, mountpoint])
+        .args(["mount", image, mountpoint])
         .spawn()
         .expect("vexfs not built — run `cargo build` first");
     thread::sleep(Duration::from_millis(500));

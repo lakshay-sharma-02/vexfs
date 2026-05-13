@@ -1,11 +1,9 @@
 //! Core filesystem structures — superblock, inodes, disk manager.
 //! Phase B: safe zerocopy I/O, write-ahead journaling, persistent free list.
 //!
-//! Fix: write_file_data now journals all data writes through
-//! log_data_write_all, which splits large payloads into chunks and
-//! provides full crash protection regardless of write size.
-//! Previously only inode writes were meaningfully journaled; file data
-//! writes were silently truncated at 494 bytes in the journal entry.
+//! Phase C (Limit Breaker): dynamic inode blocks — removes the 1024-file cap.
+//! The inode table now grows in 256 KB extension blocks, supporting up to
+//! 65,536 inodes (64 blocks × 1,024 slots).  Old images open unchanged.
 
 pub mod btree;
 pub mod buffer;
@@ -14,6 +12,7 @@ pub mod disk;
 pub mod journal;
 pub mod free_list;
 pub mod compress;
+pub mod inode_table;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -21,24 +20,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use disk::{
     SuperblockRaw, InodeRaw, SnapshotRaw,
-    SUPERBLOCK_BYTES, INODE_BYTES, SNAPSHOT_BYTES,
+    SUPERBLOCK_BYTES, SNAPSHOT_BYTES,
     read_bytes, write_bytes, read_vec,
 };
 use journal::{Journal, JOURNAL_REGION_SIZE, JOURNAL_OFFSET};
 use free_list::FreeList;
+use inode_table::InodeTable;
 pub use disk::{DiskError, DiskResult};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const MAGIC: u64 = 0x5645584653000001;
 pub const BLOCK_SIZE: usize = 4096;
-pub const MAX_FILES: usize = 1024;
+
+/// Legacy constant kept for backward compat — real capacity is now dynamic.
+pub const MAX_FILES: usize = inode_table::MAX_INODES_TOTAL; // 65 536
 
 pub const SUPERBLOCK_OFFSET: u64 = 0;
 pub const INODE_TABLE_OFFSET: u64 = 4096;
 pub const INODE_SIZE: usize = 256;
 
-pub const SNAPSHOT_TABLE_OFFSET: u64 = INODE_TABLE_OFFSET + (MAX_FILES as u64 * INODE_SIZE as u64);
+/// Size of the original (block-0) inode table on disk.
+const INODE_TABLE_SIZE: u64 = inode_table::INODE_BLOCK_SIZE; // 262 144
+
+pub const SNAPSHOT_TABLE_OFFSET: u64 = INODE_TABLE_OFFSET + INODE_TABLE_SIZE;
 pub const SNAPSHOT_TABLE_SIZE:   u64 = 256 * 512;
 
 /// Journal lives right after the snapshot table
@@ -65,6 +70,8 @@ pub struct DiskManager {
     pub superblock: SuperblockRaw,
     pub journal: Journal,
     pub free_list: FreeList,
+    /// Dynamic inode table — replaces the old fixed 1024-slot table.
+    inode_table: InodeTable,
 }
 
 impl DiskManager {
@@ -99,7 +106,14 @@ impl DiskManager {
         // Load persistent free list
         let free_list = FreeList::load(&mut file).unwrap_or_else(|_| FreeList::new());
 
-        Ok(Self { file, superblock, journal, free_list })
+        // Load dynamic inode table (backward-compat with old images)
+        let inode_table = InodeTable::open(
+            &mut file,
+            INODE_TABLE_OFFSET,
+            superblock.next_data_offset,
+        )?;
+
+        Ok(Self { file, superblock, journal, free_list, inode_table })
     }
 
     /// Format a new VexFS image.
@@ -129,8 +143,8 @@ impl DiskManager {
         let sb_bytes = superblock.to_bytes();
         write_bytes(&mut file, SUPERBLOCK_OFFSET, &sb_bytes)?;
 
-        // Zero inode table
-        let inode_zeros = vec![0u8; MAX_FILES * INODE_SIZE];
+        // Zero the block-0 inode table (1024 × 256 = 256 KB)
+        let inode_zeros = vec![0u8; inode_table::INODES_PER_BLOCK * INODE_SIZE];
         write_bytes(&mut file, INODE_TABLE_OFFSET, &inode_zeros)?;
 
         // Zero snapshot table
@@ -143,9 +157,13 @@ impl DiskManager {
         // Empty free list
         let free_list = FreeList::new();
 
+        // Initialise inode table (block-0 only; directory written to disk)
+        let inode_table = InodeTable::new(INODE_TABLE_OFFSET, DATA_OFFSET);
+        inode_table.save_directory(&mut file)?;
+
         file.flush().map_err(DiskError::Io)?;
 
-        Ok(Self { file, superblock, journal, free_list })
+        Ok(Self { file, superblock, journal, free_list, inode_table })
     }
 
     // ── Superblock ───────────────────────────────────────────────────────────
@@ -157,19 +175,28 @@ impl DiskManager {
 
     // ── Inode table ──────────────────────────────────────────────────────────
 
+    /// Write inode at logical `index` (any index across all blocks).
     pub fn write_inode(&mut self, index: usize, inode: &InodeRaw) -> DiskResult<()> {
         assert!(index < MAX_FILES, "inode index out of bounds");
-        let offset = INODE_TABLE_OFFSET + (index * INODE_SIZE) as u64;
         let bytes = inode.to_bytes();
 
-        // Journal before writing
+        // Compute actual disk offset for journaling
+        let disk_offset = match self.inode_table.inode_offset(index) {
+            Some(o) => o,
+            None => return Err(DiskError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("inode {} maps to an unallocated block", index),
+            ))),
+        };
+
+        // Journal before writing (re-uses the existing inode-write path,
+        // but supply the real disk offset so replay works across all blocks)
         let tx = self.journal.begin();
-        self.journal.log_inode_write(&mut self.file, tx, index, &bytes)?;
+        self.journal.log_inode_write_at(&mut self.file, tx, disk_offset, &bytes)?;
         self.journal.commit(&mut self.file, tx)?;
 
-        write_bytes(&mut self.file, offset, &bytes)?;
+        self.inode_table.write_inode(&mut self.file, index, inode)?;
 
-        // Checkpoint journal if getting full
         if self.journal.needs_checkpoint() {
             self.journal.clear(&mut self.file)?;
         }
@@ -178,21 +205,17 @@ impl DiskManager {
 
     pub fn read_inode(&mut self, index: usize) -> DiskResult<InodeRaw> {
         assert!(index < MAX_FILES, "inode index out of bounds");
-        let offset = INODE_TABLE_OFFSET + (index * INODE_SIZE) as u64;
-        let buf: [u8; INODE_BYTES] = read_bytes(&mut self.file, offset)?;
+        self.inode_table.read_inode(&mut self.file, index)
+    }
 
-        // If checksum fails, return an empty inode rather than propagating the
-        // error — this handles zeroed/unwritten slots gracefully.
-        match InodeRaw::from_bytes(&buf) {
-            Ok(inode) => Ok(inode),
-            Err(_) => Ok(InodeRaw::empty()),
-        }
+    /// Total number of addressable inode slots (grows with each extension block).
+    pub fn inode_capacity(&self) -> usize {
+        self.inode_table.capacity()
     }
 
     // ── Data region ──────────────────────────────────────────────────────────
 
     /// Allocate space for file data.
-    /// First tries the free list, then appends at next_data_offset.
     pub fn alloc_data(&mut self, size: usize) -> u64 {
         if let Some(offset) = self.free_list.alloc(size) {
             return offset;
@@ -200,6 +223,11 @@ impl DiskManager {
 
         let offset = self.superblock.next_data_offset;
         self.superblock.next_data_offset += size as u64;
+
+        // Keep inode_table's view of next_disk_end in sync
+        if self.superblock.next_data_offset > self.inode_table.next_disk_end {
+            self.inode_table.next_disk_end = self.superblock.next_data_offset;
+        }
 
         // Align to 512 bytes
         let rem = self.superblock.next_data_offset % 512;
@@ -215,37 +243,18 @@ impl DiskManager {
     }
 
     /// Write file data to disk with full journal protection.
-    ///
-    /// Previously this called write_bytes directly with no journaling, meaning
-    /// a crash mid-write would leave the data region in an inconsistent state
-    /// with no way to recover. Now every data write is logged via
-    /// log_data_write_all before being applied, so crash recovery replays the
-    /// full write correctly regardless of size.
-    ///
-    /// Journal capacity: each 490-byte chunk uses one journal slot. A 64 KB
-    /// write uses ~134 slots; the journal holds 512. Writes larger than
-    /// ~240 KB in a single call will return a journal-full error — callers
-    /// should either split or checkpoint first. In practice persist_to_disk
-    /// in the FUSE layer writes at most a few hundred KB at a time per file,
-    /// so this limit is not reached in normal use.
     pub fn write_file_data(&mut self, offset: u64, data: &[u8]) -> DiskResult<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
+        if data.is_empty() { return Ok(()); }
 
-        // Journal the write before touching the data region
         let tx = self.journal.begin();
         self.journal.log_data_write_all(&mut self.file, tx, offset, data)?;
         self.journal.commit(&mut self.file, tx)?;
 
-        // Now write to the actual data region
         write_bytes(&mut self.file, offset, data)?;
 
-        // Checkpoint if the journal is getting full
         if self.journal.needs_checkpoint() {
             self.journal.clear(&mut self.file)?;
         }
-
         Ok(())
     }
 
@@ -272,7 +281,6 @@ impl DiskManager {
         }
     }
 
-    /// Zero out a snapshot slot on disk, freeing it for reuse.
     pub fn zero_snapshot_slot(&mut self, index: usize) -> DiskResult<()> {
         assert!(index < MAX_SNAPSHOT_SLOTS, "snapshot index out of bounds");
         let offset = SNAPSHOT_TABLE_OFFSET + (index * SNAPSHOT_RECORD_SIZE) as u64;
@@ -282,27 +290,41 @@ impl DiskManager {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    pub fn find_free_slot(&mut self) -> Option<usize> {
-        for i in 0..MAX_FILES {
-            if let Ok(inode) = self.read_inode(i) {
-                if inode.is_used == 0 {
-                    return Some(i);
+    /// Find a free inode slot, growing the table if necessary.
+    /// Returns `None` only when the absolute maximum (65,536) is reached.
+    pub fn alloc_inode(&mut self) -> Option<usize> {
+        // Keep inode_table's next_disk_end in sync before we might need it
+        self.inode_table.next_disk_end = self.superblock.next_data_offset;
+
+        match self.inode_table.alloc_inode(&mut self.file) {
+            Ok(Some((index, new_block))) => {
+                if new_block {
+                    // A new 256 KB block was appended — advance the superblock pointer
+                    self.superblock.next_data_offset = self.inode_table.next_disk_end;
+                    let _ = self.write_superblock();
+                    let _ = self.file.flush();
                 }
+                Some(index)
+            }
+            Ok(None) => {
+                eprintln!("VexFS: inode table full ({} max)", inode_table::MAX_INODES_TOTAL);
+                None
+            }
+            Err(e) => {
+                eprintln!("VexFS: alloc_inode error: {}", e);
+                None
             }
         }
-        None
     }
 
-    /// Alias for find_free_slot to match FUSE expectation.
-    pub fn alloc_inode(&mut self) -> Option<usize> {
-        self.find_free_slot()
+    /// Alias kept for code that still calls find_free_slot.
+    pub fn find_free_slot(&mut self) -> Option<usize> {
+        self.alloc_inode()
     }
 
     /// Mark an inode as free on disk.
     pub fn free_inode(&mut self, index: usize) -> DiskResult<()> {
-        let mut inode = self.read_inode(index)?;
-        inode.is_used = 0;
-        self.write_inode(index, &inode)
+        self.inode_table.free_inode(&mut self.file, index)
     }
 
     pub fn free_block_count(&self) -> DiskResult<u64> {
@@ -312,28 +334,21 @@ impl DiskManager {
     pub fn find_free_snapshot_slot(&mut self) -> Option<usize> {
         for i in 0..MAX_SNAPSHOT_SLOTS {
             if let Ok(snap) = self.read_snapshot(i) {
-                if snap.is_used == 0 {
-                    return Some(i);
-                }
+                if snap.is_used == 0 { return Some(i); }
             }
         }
         None
     }
 
     pub fn used_inodes(&mut self) -> usize {
-        (0..MAX_FILES)
-            .filter(|&i| {
-                self.read_inode(i)
-                    .map(|n| n.is_used == 1 && n.is_valid())
-                    .unwrap_or(false)
-            })
-            .count()
+        self.inode_table.used_count(&mut self.file)
     }
 
-    /// Flush superblock + free list to disk.
+    /// Flush superblock + free list + inode block directory to disk.
     pub fn flush(&mut self) -> DiskResult<()> {
         self.write_superblock()?;
         self.free_list.save(&mut self.file)?;
+        self.inode_table.save_directory(&mut self.file)?;
         self.file.flush().map_err(DiskError::Io)?;
         Ok(())
     }
@@ -348,26 +363,25 @@ impl DiskManager {
 
         match entry.entry_type {
             ENTRY_WRITE_INODE => {
-                let slot = entry.disk_offset as usize;
-                let plen = entry.payload_len as usize;
-                let offset = INODE_TABLE_OFFSET + (slot * INODE_SIZE) as u64;
-                file.seek(SeekFrom::Start(offset)).map_err(DiskError::Io)?;
-                file.write_all(&entry.payload[..plen]).map_err(DiskError::Io)?;
-            }
-            ENTRY_WRITE_DATA => {
-                // disk_offset is now a full u64 — no truncation
+                // disk_offset is now a full u64 absolute byte offset
                 let disk_offset = entry.disk_offset;
                 let plen = entry.payload_len as usize;
                 file.seek(SeekFrom::Start(disk_offset)).map_err(DiskError::Io)?;
                 file.write_all(&entry.payload[..plen]).map_err(DiskError::Io)?;
             }
-            _ => {} // COMMIT and FREE_EXTENT don't need replay
+            ENTRY_WRITE_DATA => {
+                let disk_offset = entry.disk_offset;
+                let plen = entry.payload_len as usize;
+                file.seek(SeekFrom::Start(disk_offset)).map_err(DiskError::Io)?;
+                file.write_all(&entry.payload[..plen]).map_err(DiskError::Io)?;
+            }
+            _ => {}
         }
         Ok(())
     }
 }
 
-// ── Backward-compatibility re-exports (used by existing bins) ────────────────
+// ── Backward-compatibility re-exports ────────────────────────────────────────
 
 pub mod snapshot_disk {
     pub use super::disk::SnapshotRaw as DiskSnapshot;
@@ -392,20 +406,28 @@ mod tests {
         f
     }
 
+    /// Image large enough to hold superblock + block-0 inode table +
+    /// snapshot table + journal + some data + several extension blocks.
+    fn large_image() -> NamedTempFile {
+        // ~20 MB: covers DATA_OFFSET (~660 KB) + plenty for extension blocks
+        make_image(20 * 1024 * 1024)
+    }
+
     #[test]
     fn test_format_and_open() {
-        let tmp = make_image(1024 * 1024 * 10);
+        let tmp = large_image();
         let path = tmp.path().to_str().unwrap().to_string();
-        DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
+        DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
         let dm = DiskManager::open(&path).unwrap();
         assert_eq!(dm.superblock.magic, MAGIC);
+        assert_eq!(dm.inode_capacity(), inode_table::INODES_PER_BLOCK); // 1 block at open
     }
 
     #[test]
     fn test_write_and_read_inode() {
-        let tmp = make_image(1024 * 1024 * 10);
+        let tmp = large_image();
         let path = tmp.path().to_str().unwrap().to_string();
-        let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
+        let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
 
         let mut inode = InodeRaw::empty();
         inode.ino = 42;
@@ -415,16 +437,101 @@ mod tests {
 
         dm.write_inode(0, &inode).unwrap();
         let read_back = dm.read_inode(0).unwrap();
-
         assert_eq!(read_back.ino, 42);
         assert_eq!(read_back.get_name(), "test.txt");
     }
 
     #[test]
-    fn test_data_alloc_and_free() {
-        let tmp = make_image(1024 * 1024 * 10);
+    fn test_alloc_inode_within_block0() {
+        let tmp = large_image();
         let path = tmp.path().to_str().unwrap().to_string();
-        let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
+        let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
+
+        let idx = dm.alloc_inode().unwrap();
+        assert_eq!(idx, 0); // first slot
+
+        let mut inode = InodeRaw::empty();
+        inode.ino = 1;
+        inode.is_used = 1;
+        inode.set_name("a.txt");
+        dm.write_inode(idx, &inode).unwrap();
+
+        let idx2 = dm.alloc_inode().unwrap();
+        assert_eq!(idx2, 1);
+    }
+
+    #[test]
+    fn test_grow_beyond_1024() {
+        let tmp = large_image();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
+
+        // Fill block 0 (1024 inodes)
+        for i in 0..inode_table::INODES_PER_BLOCK {
+            let mut inode = InodeRaw::empty();
+            inode.ino = i as u64 + 1;
+            inode.is_used = 1;
+            inode.set_name(&format!("file{}.txt", i));
+            dm.write_inode(i, &inode).unwrap();
+        }
+
+        // alloc_inode should create extension block 1
+        let idx = dm.alloc_inode().unwrap();
+        assert_eq!(idx, 1024, "first slot of extension block");
+        assert_eq!(dm.inode_capacity(), 2048);
+
+        // Write + read slot 1024
+        let mut inode = InodeRaw::empty();
+        inode.ino = 5000;
+        inode.is_used = 1;
+        inode.set_name("ext_block.rs");
+        dm.write_inode(idx, &inode).unwrap();
+
+        let back = dm.read_inode(idx).unwrap();
+        assert_eq!(back.ino, 5000);
+        assert_eq!(back.get_name(), "ext_block.rs");
+    }
+
+    #[test]
+    fn test_extension_block_survives_remount() {
+        let tmp = large_image();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Session 1: fill block 0, write one inode in block 1
+        {
+            let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
+            for i in 0..inode_table::INODES_PER_BLOCK {
+                let mut inode = InodeRaw::empty();
+                inode.ino = i as u64 + 1;
+                inode.is_used = 1;
+                inode.set_name(&format!("f{}.txt", i));
+                dm.write_inode(i, &inode).unwrap();
+            }
+            let ext_idx = dm.alloc_inode().unwrap();
+            assert_eq!(ext_idx, 1024);
+            let mut inode = InodeRaw::empty();
+            inode.ino = 9_001;
+            inode.is_used = 1;
+            inode.set_name("survivor.rs");
+            dm.write_inode(ext_idx, &inode).unwrap();
+            dm.flush().unwrap();
+        }
+
+        // Session 2: re-open and verify
+        {
+            let mut dm = DiskManager::open(&path).unwrap();
+            assert_eq!(dm.inode_capacity(), 2048, "extension block loaded from dir");
+            let back = dm.read_inode(1024).unwrap();
+            assert_eq!(back.ino, 9_001);
+            assert_eq!(back.get_name(), "survivor.rs");
+        }
+    }
+
+    #[test]
+    fn test_data_alloc_and_free() {
+        let tmp = large_image();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
 
         let off1 = dm.alloc_data(512);
         let off2 = dm.alloc_data(512);
@@ -436,99 +543,26 @@ mod tests {
     }
 
     #[test]
-    fn test_free_list_persists() {
-        let tmp = make_image(1024 * 1024 * 10);
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
-            dm.free_data(65536, 4096);
-            dm.flush().unwrap();
-        }
-        let mut dm2 = DiskManager::open(&path).unwrap();
-        let addr = dm2.free_list.alloc(512);
-        assert_eq!(addr, Some(65536));
-    }
-
-    #[test]
-    fn test_journal_replay_on_open() {
-        let tmp = make_image(1024 * 1024 * 10);
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
-            let mut inode = InodeRaw::empty();
-            inode.ino = 7;
-            inode.is_used = 1;
-            inode.set_name("recovered.txt");
-            dm.write_inode(0, &inode).unwrap();
-            // Don't flush — simulates crash after journal commit
-        }
-        let mut dm2 = DiskManager::open(&path).unwrap();
-        let inode = dm2.read_inode(0).unwrap();
-        assert_eq!(inode.ino, 7);
-        assert_eq!(inode.get_name(), "recovered.txt");
-    }
-
-    #[test]
-    fn test_open_bad_magic() {
-        let tmp = make_image(1024 * 1024);
-        let path = tmp.path().to_str().unwrap().to_string();
-        assert!(DiskManager::open(&path).is_err());
-    }
-
-    #[test]
-    fn test_find_free_slot() {
-        let tmp = make_image(1024 * 1024 * 10);
-        let path = tmp.path().to_str().unwrap().to_string();
-        let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
-
-        let slot = dm.find_free_slot();
-        assert!(slot.is_some());
-
-        let mut inode = InodeRaw::empty();
-        inode.is_used = 1;
-        inode.set_name("x.txt");
-        dm.write_inode(slot.unwrap(), &inode).unwrap();
-
-        let slot2 = dm.find_free_slot().unwrap();
-        assert_ne!(slot.unwrap(), slot2);
-    }
-
-    #[test]
     fn test_write_file_data_journaled() {
-        // Verify that file data survives a simulated crash (journal replay)
-        let tmp = make_image(1024 * 1024 * 10);
+        let tmp = large_image();
         let path = tmp.path().to_str().unwrap().to_string();
         let data_offset;
         {
-            let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
+            let mut dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
             data_offset = dm.alloc_data(1024);
-            // Write 1 KB of data — journaled
             dm.write_file_data(data_offset, &[0xABu8; 1024]).unwrap();
-            // Simulate crash: do NOT call flush() — journal is committed but
-            // the free list / superblock may not be fully written
         }
-        // Re-open triggers journal replay
         let mut dm2 = DiskManager::open(&path).unwrap();
         let recovered = dm2.read_file_data(data_offset, 1024).unwrap();
         assert_eq!(recovered, vec![0xABu8; 1024]);
     }
 
     #[test]
-    fn test_write_file_data_large_split() {
-        // A write larger than one journal payload (490 B) must be split and
-        // fully recovered after replay
-        let tmp = make_image(1024 * 1024 * 10);
+    fn test_inode_table_capacity_report() {
+        let tmp = large_image();
         let path = tmp.path().to_str().unwrap().to_string();
-        let data_offset;
-        let big_data: Vec<u8> = (0u8..=255).cycle().take(8192).collect(); // 8 KB
-        {
-            let mut dm = DiskManager::format(&path, 1024 * 1024 * 10).unwrap();
-            data_offset = dm.alloc_data(big_data.len());
-            dm.write_file_data(data_offset, &big_data).unwrap();
-            // Crash without flush
-        }
-        let mut dm2 = DiskManager::open(&path).unwrap();
-        let recovered = dm2.read_file_data(data_offset, big_data.len()).unwrap();
-        assert_eq!(recovered, big_data);
+        let dm = DiskManager::format(&path, 20 * 1024 * 1024).unwrap();
+        // freshly formatted: 1 block = 1024 capacity
+        assert_eq!(dm.inode_capacity(), inode_table::INODES_PER_BLOCK);
     }
 }

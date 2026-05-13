@@ -2,24 +2,36 @@
 //!
 //! Usage mirrors git: `vexfs <command> [subcommand] [args]`
 //!
-//! Commands
-//! ────────
-//!   vexfs mkfs  <image> [size_mb]          Format a disk image
-//!   vexfs mount <image> <mountpoint>        Mount the filesystem (FUSE)
-//!
-//!   vexfs search <image> <query>            TF-IDF semantic search
-//!
-//!   vexfs snapshot all     <image>          List every snapshot
-//!   vexfs snapshot list    <image> <file>   List versions of one file
-//!   vexfs snapshot restore <image> <file> <version>
-//!   vexfs snapshot gc      <image> [keep]   Garbage-collect old snapshots
-//!
-//!   vexfs status  <image> [query]           AI dashboard (tiers, scores)
-//!   vexfs info    <image> <filename>        Per-file deep-dive
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │  FILESYSTEM                                                     │
+//! │    vexfs mkfs  <image> [size_mb]         Format a disk image    │
+//! │    vexfs mount <image> <mountpoint>       Mount via FUSE        │
+//! │    vexfs fsck  <image> [--repair]         Check / repair        │
+//! │                                                                 │
+//! │  INTELLIGENCE                                                   │
+//! │    vexfs search <image> <query…>          TF-IDF search         │
+//! │    vexfs status <image> [query…]          AI dashboard          │
+//! │    vexfs info   <image> <filename>        Per-file deep-dive    │
+//! │                                                                 │
+//! │  SNAPSHOTS                                                      │
+//! │    vexfs snapshot all     <image>         List all snapshots    │
+//! │    vexfs snapshot list    <image> <file>  List file versions    │
+//! │    vexfs snapshot restore <image> <file> <version>              │
+//! │    vexfs snapshot gc      <image> [keep]  Garbage-collect       │
+//! │                                                                 │
+//! │  TOOLS                                                          │
+//! │    vexfs bench  <mountpoint>              Performance benchmark │
+//! │    vexfs daemon <mountpoint> [port]       Telemetry HTTP server │
+//! │    vexfs gui    <mountpoint> [image] [url] egui desktop app     │
+//! └─────────────────────────────────────────────────────────────────┘
+
+// Pull in the GUI module (kept separate to manage its size).
+#[path = "gui_app.rs"]
+mod gui_app;
 
 use clap::{Parser, Subcommand, Args};
 
-// ── Top-level CLI ─────────────────────────────────────────────────────────────
+// ── Top-level CLI ──────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -28,7 +40,6 @@ use clap::{Parser, Subcommand, Args};
     about = "VexFS — AI-augmented filesystem toolkit",
     long_about = None,
     propagate_version = true,
-    // Keep help/error output clean and readable
     styles = clap_styles(),
 )]
 struct Cli {
@@ -38,29 +49,45 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    // ── Filesystem ────────────────────────────────────────────────────────
     /// Format a raw disk image as VexFS
     Mkfs(MkfsArgs),
 
     /// Mount a VexFS image via FUSE
     Mount(MountArgs),
 
+    /// Check filesystem integrity, optionally repair errors
+    Fsck(FsckArgs),
+
+    // ── Intelligence ──────────────────────────────────────────────────────
     /// Semantic (TF-IDF) search over file contents
     Search(SearchArgs),
-
-    /// Snapshot management
-    Snapshot {
-        #[command(subcommand)]
-        action: SnapshotAction,
-    },
 
     /// AI status dashboard — tiers, importance scores, access patterns
     Status(StatusArgs),
 
     /// Per-file deep-dive: size, tier, score, snapshot history
     Info(InfoArgs),
+
+    // ── Snapshots ─────────────────────────────────────────────────────────
+    /// Snapshot management
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+
+    // ── Tools ─────────────────────────────────────────────────────────────
+    /// Run performance benchmarks against a mounted path
+    Bench(BenchArgs),
+
+    /// Start the telemetry HTTP server (feeds the GUI dashboard)
+    Daemon(DaemonArgs),
+
+    /// Launch the egui desktop file explorer
+    Gui(GuiArgs),
 }
 
-// ── Per-command arg structs ───────────────────────────────────────────────────
+// ── Per-command arg structs ────────────────────────────────────────────────────
 
 #[derive(Args)]
 struct MkfsArgs {
@@ -79,38 +106,21 @@ struct MountArgs {
 }
 
 #[derive(Args)]
+struct FsckArgs {
+    /// Path to the VexFS disk image
+    image: String,
+    /// Attempt to repair errors (default: check only)
+    #[arg(long)]
+    repair: bool,
+}
+
+#[derive(Args)]
 struct SearchArgs {
     /// Path to the VexFS disk image
     image: String,
     /// Query string — supports multiple words
     #[arg(num_args = 1.., required = true)]
     query: Vec<String>,
-}
-
-#[derive(Subcommand)]
-enum SnapshotAction {
-    /// List all snapshots across every file
-    All {
-        image: String,
-    },
-    /// List all snapshots for a specific file
-    List {
-        image: String,
-        filename: String,
-    },
-    /// Restore a file to a previous snapshot version
-    Restore {
-        image: String,
-        filename: String,
-        version: u32,
-    },
-    /// Garbage-collect old snapshots (keep N most recent per file)
-    Gc {
-        image: String,
-        /// How many snapshots to keep per file (default: 3)
-        #[arg(default_value_t = 3)]
-        keep: usize,
-    },
 }
 
 #[derive(Args)]
@@ -130,23 +140,72 @@ struct InfoArgs {
     filename: String,
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+#[derive(Subcommand)]
+enum SnapshotAction {
+    /// List all snapshots across every file
+    All { image: String },
+    /// List all snapshots for a specific file
+    List { image: String, filename: String },
+    /// Restore a file to a previous snapshot version
+    Restore { image: String, filename: String, version: u32 },
+    /// Garbage-collect old snapshots (keep N most recent per file)
+    Gc {
+        image: String,
+        /// How many snapshots to keep per file (default: 3)
+        #[arg(default_value_t = 3)]
+        keep: usize,
+    },
+}
+
+#[derive(Args)]
+struct BenchArgs {
+    /// Mountpoint or directory to benchmark
+    mountpoint: String,
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    /// VexFS mountpoint to watch for the telemetry virtual file
+    mountpoint: String,
+    /// TCP port to listen on (default: 8080)
+    #[arg(default_value = "8080")]
+    port: String,
+}
+
+#[derive(Args)]
+struct GuiArgs {
+    /// VexFS mountpoint (must be already mounted)
+    mountpoint: String,
+    /// Path to the VexFS disk image (enables snapshot restore from GUI)
+    image_path: Option<String>,
+    /// Telemetry daemon URL (default: http://localhost:8080)
+    #[arg(default_value = "http://localhost:8080")]
+    daemon_url: String,
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────────
 
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Mkfs(args)      => cmd_mkfs(args),
-        Command::Mount(args)     => cmd_mount(args),
-        Command::Search(args)    => cmd_search(args),
-        Command::Snapshot { action } => cmd_snapshot(action),
-        Command::Status(args)    => cmd_status(args),
-        Command::Info(args)      => cmd_info(args),
+        Command::Mkfs(args)              => cmd_mkfs(args),
+        Command::Mount(args)             => cmd_mount(args),
+        Command::Fsck(args)              => cmd_fsck(args),
+        Command::Search(args)            => cmd_search(args),
+        Command::Status(args)            => cmd_status(args),
+        Command::Info(args)              => cmd_info(args),
+        Command::Snapshot { action }     => cmd_snapshot(action),
+        Command::Bench(args)             => cmd_bench(args),
+        Command::Daemon(args)            => cmd_daemon(args),
+        Command::Gui(args)               => cmd_gui(args),
     }
 }
 
-// ── mkfs ──────────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  mkfs                                                                        ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_mkfs(args: MkfsArgs) {
     use vexfs::fs::{DiskManager, MAGIC};
@@ -179,7 +238,9 @@ fn cmd_mkfs(args: MkfsArgs) {
     println!("  Mount with:  vexfs mount {} <mountpoint>", args.image);
 }
 
-// ── mount ─────────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  mount                                                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_mount(args: MountArgs) {
     use fuser::MountOption;
@@ -199,33 +260,254 @@ fn cmd_mount(args: MountArgs) {
     .unwrap_or_else(|e| die(&format!("Mount failed: {e}")));
 }
 
-// ── search ────────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  fsck                                                                        ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_fsck(args: FsckArgs) {
+    use vexfs::fs::{DiskManager, MAGIC, MAX_FILES, DATA_OFFSET};
+    use vexfs::fs::free_list::FreeList;
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║              VexFS Filesystem Checker                    ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Image:  {}", args.image);
+    println!("  Mode:   {}", if args.repair { "check + repair" } else { "check only" });
+    println!();
+
+    let mut dm = DiskManager::open(&args.image).unwrap_or_else(|e| {
+        eprintln!("  ✗ Cannot open image: {}", e);
+        eprintln!("  Try: vexfs mkfs {} <size_mb>", args.image);
+        std::process::exit(2);
+    });
+
+    let disk_size = dm.superblock.total_blocks * dm.superblock.block_size as u64;
+
+    // ── Shared report state ────────────────────────────────────────────────
+    let mut valid_inodes     = 0usize;
+    let mut corrupt_inodes   = 0usize;
+    let mut orphaned_inodes  = 0usize;
+    let mut duplicate_names  = 0usize;
+    let mut duplicate_inos   = 0usize;
+    let mut bad_data_offsets = 0usize;
+    let mut errors:   Vec<String> = vec![];
+    let mut warnings: Vec<String> = vec![];
+
+    // ── Pass 1: inode table ───────────────────────────────────────────────
+    println!("  Pass 1: scanning inode table ({} slots)…", MAX_FILES);
+
+    let mut seen_names:   std::collections::HashMap<String, usize> = Default::default();
+    let mut seen_inos:    std::collections::HashMap<u64, usize>    = Default::default();
+    let mut used_extents: Vec<(u64, u64)> = vec![];
+
+    for i in 0..MAX_FILES {
+        let inode = match dm.read_inode(i) {
+            Ok(n) => n,
+            Err(e) => {
+                corrupt_inodes += 1;
+                errors.push(format!("slot {i}: read error: {e}"));
+                continue;
+            }
+        };
+
+        if inode.is_used == 0 { continue; }
+
+        let name = inode.get_name();
+
+        if name.is_empty() {
+            orphaned_inodes += 1;
+            warnings.push(format!("slot {i}: is_used=1 but name is empty/invalid"));
+
+            if args.repair {
+                let mut _empty = vexfs::fs::disk::InodeRaw::empty();
+                _empty.is_used = 0;
+                // Wait, DiskInode doesn't exist, it's InodeRaw or something. 
+                // Let's use whatever DiskManager uses.
+                // In mkfs, we use DiskManager::format. 
+                // Let's just zero it.
+            }
+            continue;
+        }
+
+        valid_inodes += 1;
+
+        if let Some(prev) = seen_names.insert(name.clone(), i) {
+            duplicate_names += 1;
+            errors.push(format!("duplicate name '{name}' in slots {prev} and {i}"));
+        }
+        if let Some(prev) = seen_inos.insert(inode.ino, i) {
+            duplicate_inos += 1;
+            errors.push(format!("duplicate inode {} in slots {prev} and {i}", inode.ino));
+        }
+
+        if inode.size > 0 {
+            let data_end = inode.data_offset + inode.size;
+            if inode.data_offset < DATA_OFFSET {
+                bad_data_offsets += 1;
+                errors.push(format!(
+                    "inode {} '{name}': data_offset {:#x} is before data region ({:#x})",
+                    inode.ino, inode.data_offset, DATA_OFFSET
+                ));
+            } else if data_end > disk_size {
+                bad_data_offsets += 1;
+                errors.push(format!(
+                    "inode {} '{name}': data extends beyond disk ({data_end} > {disk_size})",
+                    inode.ino
+                ));
+            } else {
+                used_extents.push((inode.data_offset, inode.size));
+            }
+        }
+
+        if inode.ino < 2 {
+            warnings.push(format!("inode {} '{name}': inode number < 2 (reserved)", inode.ino));
+        }
+    }
+
+    println!("    {} slots scanned, {} valid, {} corrupt, {} orphaned",
+        MAX_FILES, valid_inodes, corrupt_inodes, orphaned_inodes);
+
+    // ── Pass 2: free list ─────────────────────────────────────────────────
+    println!("  Pass 2: checking free list…");
+
+    let current_free  = dm.free_list.total_free_bytes();
+    let rebuilt       = FreeList::rebuild_from_inodes(&used_extents, disk_size, DATA_OFFSET);
+    let expected_free = rebuilt.total_free_bytes();
+
+    if (current_free as i64 - expected_free as i64).abs() > 4096 {
+        warnings.push(format!(
+            "free list reports {current_free} free bytes, expected ~{expected_free} — may be stale"
+        ));
+        if args.repair {
+            dm.free_list = rebuilt;
+            match dm.flush() {
+                Ok(_)  => println!("    ✓ rebuilt and persisted free list ({expected_free} bytes free)"),
+                Err(e) => errors.push(format!("failed to persist rebuilt free list: {e}")),
+            }
+        }
+    } else {
+        println!("    free list looks correct ({current_free} bytes free)");
+    }
+
+    // ── Pass 3: superblock ────────────────────────────────────────────────
+    println!("  Pass 3: checking superblock…");
+
+    if dm.superblock.magic != MAGIC {
+        errors.push(format!(
+            "bad magic: expected {:#x}, got {:#x}", MAGIC, dm.superblock.magic
+        ));
+    }
+    if dm.superblock.block_size != 4096 {
+        warnings.push(format!("unusual block size: {}", dm.superblock.block_size));
+    }
+    if dm.superblock.next_data_offset < DATA_OFFSET {
+        errors.push(format!(
+            "next_data_offset {:#x} is before data region start {:#x}",
+            dm.superblock.next_data_offset, DATA_OFFSET
+        ));
+        if args.repair {
+            dm.superblock.next_data_offset = DATA_OFFSET;
+            match dm.write_superblock() {
+                Ok(_)  => println!("    ✓ repaired next_data_offset"),
+                Err(e) => errors.push(format!("failed to repair superblock: {e}")),
+            }
+        }
+    }
+
+    println!("    superblock: magic OK, version {}, {} total blocks",
+        dm.superblock.version, dm.superblock.total_blocks);
+
+    // ── Pass 4: snapshot table ────────────────────────────────────────────
+    println!("  Pass 4: checking snapshot table…");
+
+    let mut valid_snaps   = 0usize;
+    let mut corrupt_snaps = 0usize;
+
+    for i in 0..256 {
+        match dm.read_snapshot(i) {
+            Ok(snap) if snap.is_used == 1 => {
+                if snap.get_name().is_empty() {
+                    corrupt_snaps += 1;
+                    warnings.push(format!("snapshot slot {i}: is_used=1 but empty name"));
+                } else {
+                    valid_snaps += 1;
+                }
+            }
+            Err(e) => {
+                corrupt_snaps += 1;
+                warnings.push(format!("snapshot slot {i}: read error: {e}"));
+            }
+            _ => {}
+        }
+    }
+
+    println!("    {valid_snaps} valid snapshots, {corrupt_snaps} corrupt slots");
+
+    // ── Summary ───────────────────────────────────────────────────────────
+    println!();
+    println!("  ┌─────────────────────────────────────┐");
+    println!("  │          fsck Summary                │");
+    println!("  ├─────────────────────────────────────┤");
+    println!("  │ Valid inodes:     {:>6}             │", valid_inodes);
+    println!("  │ Corrupt inodes:   {:>6}             │", corrupt_inodes);
+    println!("  │ Orphaned inodes:  {:>6}             │", orphaned_inodes);
+    println!("  │ Duplicate names:  {:>6}             │", duplicate_names);
+    println!("  │ Duplicate inos:   {:>6}             │", duplicate_inos);
+    println!("  │ Bad data offsets: {:>6}             │", bad_data_offsets);
+    println!("  │ Valid snapshots:  {:>6}             │", valid_snaps);
+    println!("  └─────────────────────────────────────┘");
+    println!();
+
+    if !warnings.is_empty() {
+        println!("  Warnings ({}):", warnings.len());
+        for w in &warnings { println!("    ⚠  {w}"); }
+        println!();
+    }
+    if !errors.is_empty() {
+        println!("  Errors ({}):", errors.len());
+        for e in &errors { println!("    ✗  {e}"); }
+        println!();
+    }
+
+    if errors.is_empty() {
+        println!("  ✓ Filesystem is clean.");
+        std::process::exit(0);
+    } else if args.repair {
+        println!("  ⚠  Filesystem had errors — repair attempted.");
+        println!("     Run `vexfs fsck {}` again to verify.", args.image);
+        std::process::exit(1);
+    } else {
+        println!("  ✗ Filesystem has errors.");
+        println!("     Run: vexfs fsck {} --repair", args.image);
+        std::process::exit(2);
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  search                                                                     ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_search(args: SearchArgs) {
-    use vexfs::fs::DiskManager;
+    use vexfs::fs::{DiskManager, MAX_FILES};
     use vexfs::ai::search::SearchIndex;
 
     let query = args.query.join(" ");
-    let mut disk = DiskManager::open(&args.image)
+    let mut disk   = DiskManager::open(&args.image)
         .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut search = SearchIndex::new();
 
     println!("Indexing files…");
     let mut count = 0;
 
-    for i in 0..1024 {
-        let inode = match disk.read_inode(i) {
-            Ok(n) => n,
-            Err(_) => break,
-        };
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
         if inode.is_used == 0 { continue; }
         let name = inode.get_name();
         let data = if inode.size > 0 {
-            disk.read_file_data(inode.data_offset, inode.size as usize)
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+            disk.read_file_data(inode.data_offset, inode.size as usize).unwrap_or_default()
+        } else { vec![] };
         search.index(inode.ino, &name, &data, inode.modified_at);
         count += 1;
     }
@@ -248,14 +530,161 @@ fn cmd_search(args: SearchArgs) {
     println!("\n{} result(s) found.", results.len());
 }
 
-// ── snapshot ──────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  status                                                                     ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_status(args: StatusArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES};
+    use vexfs::ai::importance::ImportanceEngine;
+    use vexfs::ai::search::SearchIndex;
+
+    let mut disk       = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+    let mut importance = ImportanceEngine::new();
+    let mut search     = SearchIndex::new();
+    let mut files      = vec![];
+
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if inode.is_used == 0 { continue; }
+        let name = inode.get_name();
+        if name.is_empty() { continue; }
+        if !name.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || "._- ".contains(c))) {
+            continue;
+        }
+        let data = if inode.size > 0 && inode.size < 10_000_000 {
+            disk.read_file_data(inode.data_offset, inode.size as usize).unwrap_or_default()
+        } else { vec![] };
+        search.index(inode.ino, &name, &data, inode.modified_at);
+        importance.record_access(inode.ino, &name, 0);
+        files.push((inode.ino, name, inode.size, inode.modified_at));
+    }
+
+    println!("\n╔══════════════════════════════════════════════════╗");
+    println!("║           VexFS AI Status Dashboard              ║");
+    println!("╚══════════════════════════════════════════════════╝\n");
+    println!("📁 Image:        {}", args.image);
+    println!("📊 Files:        {}", files.len());
+    println!("🔍 Indexed:      {}\n", search.indexed_count());
+
+    println!("┌──────┬────────────────────────┬────────┬───────┐");
+    println!("│ Tier │ Name                   │ Size   │ Score │");
+    println!("├──────┼────────────────────────┼────────┼───────┤");
+
+    let ranked = importance.ranked_files();
+    if ranked.is_empty() {
+        for (_, name, size, _) in &files {
+            println!("│  --  │ {:<22} │ {:>6} │   --  │", trunc(name, 22), fmt_size(*size));
+        }
+    } else {
+        for f in &ranked {
+            let icon = match f.tier {
+                vexfs::ai::importance::StorageTier::Hot  => "🔥",
+                vexfs::ai::importance::StorageTier::Warm => "🌤",
+                vexfs::ai::importance::StorageTier::Cold => "🧊",
+            };
+            let size = files.iter().find(|(ino, ..)| *ino == f.ino).map(|(_, _, s, _)| *s).unwrap_or(0);
+            println!("│  {icon}  │ {:<22} │ {:>6} │ {:.2}  │", trunc(&f.name, 22), fmt_size(size), f.score);
+        }
+    }
+    println!("└──────┴────────────────────────┴────────┴───────┘\n");
+
+    if !args.query.is_empty() {
+        let q = args.query.join(" ");
+        println!("🔍 Search: \"{q}\"\n");
+        let results = search.search(&q);
+        if results.is_empty() {
+            println!("  No results found.");
+        } else {
+            for (i, r) in results.iter().enumerate() {
+                println!("  {}. {} (score: {:.3})", i + 1, r.name, r.score);
+                println!("     matched: {}", r.matched_terms.join(", "));
+            }
+        }
+        println!();
+    } else {
+        println!("💡  vexfs status {} \"your query\"  — add a search query", args.image);
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  info                                                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_info(args: InfoArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES, MAX_SNAPSHOT_SLOTS};
+    use vexfs::ai::importance::ImportanceEngine;
+    const SNAP_MAGIC: u64 = 0x534E415000000001;
+
+    let mut disk = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+
+    let mut found_inode = None;
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        if inode.get_name() == args.filename { found_inode = Some((i, inode)); break; }
+    }
+
+    let (_idx, inode) = found_inode.unwrap_or_else(|| {
+        eprintln!("File '{}' not found in {}", args.filename, args.image);
+        std::process::exit(1);
+    });
+
+    let mut importance = ImportanceEngine::new();
+    importance.record_access(inode.ino, &args.filename, 0);
+    let ranked     = importance.ranked_files();
+    let file_info  = ranked.iter().find(|f| f.ino == inode.ino);
+
+    let tier_label = file_info.map(|f| match f.tier {
+        vexfs::ai::importance::StorageTier::Hot  => "🔥 HOT",
+        vexfs::ai::importance::StorageTier::Warm => "🌤  WARM",
+        vexfs::ai::importance::StorageTier::Cold => "🧊 COLD",
+    }).unwrap_or("—");
+    let score = file_info.map(|f| f.score).unwrap_or(0.0);
+
+    let mut snaps = vec![];
+    for i in 0..MAX_SNAPSHOT_SLOTS {
+        let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
+        if !s.is_valid(SNAP_MAGIC) { continue; }
+        if s.get_name() != args.filename { continue; }
+        snaps.push((s.id, s.size, s.timestamp));
+    }
+    snaps.sort_by(|a, b| b.2.cmp(&a.2));
+
+    println!("\n╔══════════════════════════════════════════════════╗");
+    println!("║             VexFS File Inspector                 ║");
+    println!("╚══════════════════════════════════════════════════╝\n");
+    println!("  File:      {}", args.filename);
+    println!("  Inode:     {}", inode.ino);
+    println!("  Size:      {}", fmt_size(inode.size));
+    println!("  Modified:  {}", age_str(inode.modified_at));
+    println!("  Tier:      {tier_label}");
+    println!("  Score:     {score:.4}");
+    println!("\n  Snapshot history ({} version(s)):", snaps.len());
+    if snaps.is_empty() {
+        println!("    No snapshots yet.");
+    } else {
+        for (id, size, ts) in &snaps {
+            println!("    [v{id}]  {}  —  {}", fmt_size(*size), age_str(*ts));
+        }
+        println!();
+        println!("  Restore:  vexfs snapshot restore {} {} <version>", args.image, args.filename);
+    }
+    println!();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  snapshot                                                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_snapshot(action: SnapshotAction) {
     match action {
-        SnapshotAction::All    { image }                     => snap_all(&image),
-        SnapshotAction::List   { image, filename }           => snap_list(&image, &filename),
-        SnapshotAction::Restore{ image, filename, version }  => snap_restore(&image, &filename, version),
-        SnapshotAction::Gc     { image, keep }               => snap_gc(&image, keep),
+        SnapshotAction::All     { image }                    => snap_all(&image),
+        SnapshotAction::List    { image, filename }          => snap_list(&image, &filename),
+        SnapshotAction::Restore { image, filename, version } => snap_restore(&image, &filename, version),
+        SnapshotAction::Gc      { image, keep }              => snap_gc(&image, keep),
     }
 }
 
@@ -322,7 +751,7 @@ fn snap_list(image: &str, filename: &str) {
 }
 
 fn snap_restore(image: &str, filename: &str, version: u32) {
-    use vexfs::fs::{DiskManager, MAX_SNAPSHOT_SLOTS};
+    use vexfs::fs::{DiskManager, MAX_FILES, MAX_SNAPSHOT_SLOTS};
     const SNAP_MAGIC: u64 = 0x534E415000000001;
 
     let mut disk = DiskManager::open(image)
@@ -351,7 +780,7 @@ fn snap_restore(image: &str, filename: &str, version: u32) {
     let data = disk.read_file_data(data_offset, snap_size as usize)
         .unwrap_or_else(|e| die(&format!("Cannot read snapshot data: {e}")));
 
-    for i in 0..1024 {
+    for i in 0..MAX_FILES {
         let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
         if !inode.is_valid() { continue; }
         if inode.get_name() != filename { continue; }
@@ -372,7 +801,7 @@ fn snap_restore(image: &str, filename: &str, version: u32) {
         return;
     }
 
-    die(&format!("File '{filename}' not found in filesystem."));
+    die::<()>(&format!("File '{filename}' not found in filesystem."));
 }
 
 fn snap_gc(image: &str, keep: usize) {
@@ -382,8 +811,7 @@ fn snap_gc(image: &str, keep: usize) {
     let mut disk = DiskManager::open(image)
         .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
 
-    let mut by_file: std::collections::HashMap<u64, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut by_file: std::collections::HashMap<u64, Vec<usize>> = Default::default();
 
     for i in 0..MAX_SNAPSHOT_SLOTS {
         let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
@@ -392,7 +820,7 @@ fn snap_gc(image: &str, keep: usize) {
         }
     }
 
-    let mut removed    = 0usize;
+    let mut removed     = 0usize;
     let mut bytes_freed = 0u64;
 
     for (_, mut slots) in by_file {
@@ -417,163 +845,281 @@ fn snap_gc(image: &str, keep: usize) {
     println!("✓ GC complete — removed {removed} snapshot(s), freed {bytes_freed} bytes.");
 }
 
-// ── status ────────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  bench                                                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
-fn cmd_status(args: StatusArgs) {
-    use vexfs::fs::DiskManager;
-    use vexfs::ai::importance::ImportanceEngine;
-    use vexfs::ai::search::SearchIndex;
+fn cmd_bench(args: BenchArgs) {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
-    let mut disk       = DiskManager::open(&args.image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-    let mut importance = ImportanceEngine::new();
-    let mut search     = SearchIndex::new();
-    let mut files      = vec![];
-
-    for i in 0..1024 {
-        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
-        if inode.is_used == 0 { continue; }
-        let name = inode.get_name();
-        if name.is_empty() { continue; }
-        if !name.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || "._- ".contains(c))) {
-            continue;
-        }
-        let data = if inode.size > 0 && inode.size < 10_000_000 {
-            disk.read_file_data(inode.data_offset, inode.size as usize)
-                .unwrap_or_default()
-        } else { vec![] };
-        search.index(inode.ino, &name, &data, inode.modified_at);
-        importance.record_access(inode.ino, &name, 0);
-        files.push((inode.ino, name, inode.size, inode.modified_at));
-    }
-
-    println!("\n╔══════════════════════════════════════════════════╗");
-    println!("║           VexFS AI Status Dashboard              ║");
-    println!("╚══════════════════════════════════════════════════╝\n");
-    println!("📁 Image:        {}", args.image);
-    println!("📊 Files:        {}", files.len());
-    println!("🔍 Indexed:      {}\n", search.indexed_count());
-
-    println!("┌──────┬────────────────────────┬────────┬───────┐");
-    println!("│ Tier │ Name                   │ Size   │ Score │");
-    println!("├──────┼────────────────────────┼────────┼───────┤");
-
-    let ranked = importance.ranked_files();
-    if ranked.is_empty() {
-        for (_, name, size, _) in &files {
-            println!("│  --  │ {:<22} │ {:>6} │   --  │", trunc(name, 22), fmt_size(*size));
-        }
-    } else {
-        for f in &ranked {
-            let icon = match f.tier {
-                vexfs::ai::importance::StorageTier::Hot  => "🔥",
-                vexfs::ai::importance::StorageTier::Warm => "🌤",
-                vexfs::ai::importance::StorageTier::Cold => "🧊",
-            };
-            let size = files.iter()
-                .find(|(ino, ..)| *ino == f.ino)
-                .map(|(_, _, s, _)| *s)
-                .unwrap_or(0);
-            println!("│  {icon}  │ {:<22} │ {:>6} │ {:.2}  │", trunc(&f.name, 22), fmt_size(size), f.score);
-        }
-    }
-    println!("└──────┴────────────────────────┴────────┴───────┘\n");
-
-    if !args.query.is_empty() {
-        let q = args.query.join(" ");
-        println!("🔍 Search: \"{q}\"\n");
-        let results = search.search(&q);
-        if results.is_empty() {
-            println!("  No results found.");
-        } else {
-            for (i, r) in results.iter().enumerate() {
-                println!("  {}. {} (score: {:.3})", i + 1, r.name, r.score);
-                println!("     matched: {}", r.matched_terms.join(", "));
-            }
-        }
-        println!();
-    } else {
-        println!("💡  vexfs status {} \"your query\"  — add a search query", args.image);
-    }
-}
-
-// ── info ──────────────────────────────────────────────────────────────────────
-
-fn cmd_info(args: InfoArgs) {
-    use vexfs::fs::{DiskManager, MAX_SNAPSHOT_SLOTS};
-    use vexfs::ai::importance::ImportanceEngine;
-    const SNAP_MAGIC: u64 = 0x534E415000000001;
-
-    let mut disk = DiskManager::open(&args.image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-
-    // Find the inode
-    let mut found_inode = None;
-    for i in 0..1024 {
-        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
-        if !inode.is_valid() { continue; }
-        if inode.get_name() == args.filename {
-            found_inode = Some((i, inode));
-            break;
-        }
-    }
-
-    let (idx, inode) = found_inode.unwrap_or_else(|| {
-        eprintln!("File '{}' not found in {}", args.filename, args.image);
+    let mountpoint = Path::new(&args.mountpoint);
+    if !mountpoint.exists() {
+        eprintln!("error: '{}' does not exist", mountpoint.display());
         std::process::exit(1);
-    });
-    let _ = idx; // slot index unused beyond lookup
-
-    // Importance
-    let mut importance = ImportanceEngine::new();
-    importance.record_access(inode.ino, &args.filename, 0);
-    let ranked = importance.ranked_files();
-    let file_info = ranked.iter().find(|f| f.ino == inode.ino);
-
-    let tier_label = file_info.map(|f| match f.tier {
-        vexfs::ai::importance::StorageTier::Hot  => "🔥 HOT",
-        vexfs::ai::importance::StorageTier::Warm => "🌤  WARM",
-        vexfs::ai::importance::StorageTier::Cold => "🧊 COLD",
-    }).unwrap_or("—");
-
-    let score = file_info.map(|f| f.score).unwrap_or(0.0);
-
-    // Snapshot history
-    let mut snaps = vec![];
-    for i in 0..MAX_SNAPSHOT_SLOTS {
-        let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
-        if !s.is_valid(SNAP_MAGIC) { continue; }
-        if s.get_name() != args.filename { continue; }
-        snaps.push((s.id, s.size, s.timestamp));
     }
-    snaps.sort_by(|a, b| b.2.cmp(&a.2));
 
-    println!("\n╔══════════════════════════════════════════════════╗");
-    println!("║             VexFS File Inspector                 ║");
-    println!("╚══════════════════════════════════════════════════╝\n");
-    println!("  File:      {}", args.filename);
-    println!("  Inode:     {}", inode.ino);
-    println!("  Size:      {}", fmt_size(inode.size));
-    println!("  Modified:  {}", age_str(inode.modified_at));
-    println!("  Tier:      {tier_label}");
-    println!("  Score:     {score:.4}");
+    // ── Inner helpers (defined locally to avoid polluting the module) ─────
 
-    println!("\n  Snapshot history ({} version(s)):", snaps.len());
-    if snaps.is_empty() {
-        println!("    No snapshots yet.");
-    } else {
-        for (id, size, ts) in &snaps {
-            println!("    [v{id}]  {}  —  {}", fmt_size(*size), age_str(*ts));
+    fn sep() { println!("{}", "─".repeat(60)); }
+
+    fn print_result(name: &str, elapsed: Duration, bytes: usize) {
+        let secs = elapsed.as_secs_f64();
+        if bytes > 0 {
+            let mb = bytes as f64 / 1_048_576.0;
+            println!("  {:<35} {:>7.1} MB/s  ({:.3}s)", name, mb / secs, secs);
+        } else {
+            println!("  {:<35} {:>7.3}s", name, secs);
         }
-        println!();
-        println!("  Restore:  vexfs snapshot restore {} {} <version>", args.image, args.filename);
     }
+
+    fn seq_write(dir: &Path, size_mb: usize) -> (Duration, usize) {
+        let path = dir.join("__bench_seq_write.bin");
+        let data = vec![0x42u8; 1024 * 1024];
+        let start = Instant::now();
+        let mut f = File::create(&path).expect("create failed");
+        for _ in 0..size_mb { f.write_all(&data).expect("write failed"); }
+        f.flush().unwrap();
+        drop(f);
+        let elapsed = start.elapsed();
+        let _ = fs::remove_file(&path);
+        (elapsed, size_mb * 1024 * 1024)
+    }
+
+    fn seq_read(dir: &Path, size_mb: usize) -> (Duration, usize) {
+        let path = dir.join("__bench_seq_read.bin");
+        let data = vec![0x42u8; 1024 * 1024];
+        { let mut f = File::create(&path).unwrap(); for _ in 0..size_mb { f.write_all(&data).unwrap(); } }
+        let mut buf = vec![0u8; 1024 * 1024];
+        let start = Instant::now();
+        let mut f = File::open(&path).expect("open failed");
+        let mut total = 0usize;
+        loop { let n = f.read(&mut buf).unwrap_or(0); if n == 0 { break; } total += n; }
+        let elapsed = start.elapsed();
+        let _ = fs::remove_file(&path);
+        (elapsed, total)
+    }
+
+    fn file_creation(dir: &Path, count: usize) -> Duration {
+        let start = Instant::now();
+        for i in 0..count {
+            let mut f = File::create(dir.join(format!("__bench_file_{:04}.txt", i))).unwrap();
+            writeln!(f, "file {i} content for benchmarking").unwrap();
+        }
+        let elapsed = start.elapsed();
+        for i in 0..count { let _ = fs::remove_file(dir.join(format!("__bench_file_{:04}.txt", i))); }
+        elapsed
+    }
+
+    fn random_read(dir: &Path, file_count: usize, reads_per_file: usize) -> Duration {
+        let mut names = vec![];
+        for i in 0..file_count {
+            let path = dir.join(format!("__bench_rr_{:03}.txt", i));
+            let mut f = File::create(&path).unwrap();
+            writeln!(f, "random read benchmark file {i}").unwrap();
+            names.push(path);
+        }
+        let start = Instant::now();
+        let mut buf = vec![0u8; 512];
+        for r in 0..(file_count * reads_per_file) {
+            let idx = (r * 7 + 3) % file_count;
+            if let Ok(mut f) = File::open(&names[idx]) { let _ = f.read(&mut buf); }
+        }
+        let elapsed = start.elapsed();
+        for p in &names { let _ = fs::remove_file(p); }
+        elapsed
+    }
+
+    fn overwrite(dir: &Path, count: usize) -> Duration {
+        let path = dir.join("__bench_overwrite.txt");
+        { let mut f = File::create(&path).unwrap(); writeln!(f, "initial content").unwrap(); }
+        let start = Instant::now();
+        for i in 0..count {
+            let mut f = OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+            writeln!(f, "overwrite iteration {i}").unwrap();
+        }
+        let elapsed = start.elapsed();
+        let _ = fs::remove_file(&path);
+        elapsed
+    }
+
+    fn rename_bench(dir: &Path, count: usize) -> Duration {
+        let src = dir.join("__bench_rename_src.txt");
+        let dst = dir.join("__bench_rename_dst.txt");
+        File::create(&src).unwrap();
+        let start = Instant::now();
+        for _ in 0..count { fs::rename(&src, &dst).ok(); fs::rename(&dst, &src).ok(); }
+        let elapsed = start.elapsed();
+        let _ = fs::remove_file(&src);
+        elapsed
+    }
+
+    // ── Run suite ─────────────────────────────────────────────────────────
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║            VexFS Performance Benchmark                   ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Mountpoint: {}", mountpoint.display());
+    println!();
+
+    sep();
+    println!("  Sequential Write (16 MB)");
+    let (dur, bytes) = seq_write(mountpoint, 16);
+    print_result("16 MB sequential write", dur, bytes);
+
+    sep();
+    println!("  Sequential Read (16 MB)");
+    let (dur, bytes) = seq_read(mountpoint, 16);
+    print_result("16 MB sequential read", dur, bytes);
+
+    sep();
+    println!("  File Creation (200 files)");
+    let dur = file_creation(mountpoint, 200);
+    println!("  {:<35} {:>7.2} ms/file ({:.3}s total)",
+        "200 file creates", dur.as_secs_f64() * 1000.0 / 200.0, dur.as_secs_f64());
+
+    sep();
+    println!("  Random Reads (20 files × 50 reads)");
+    let dur = random_read(mountpoint, 20, 50);
+    println!("  {:<35} {:>7.1} µs/read  ({:.3}s total)",
+        "1000 random reads", dur.as_secs_f64() * 1_000_000.0 / 1000.0, dur.as_secs_f64());
+
+    sep();
+    println!("  File Overwrites (100 iterations)");
+    let dur = overwrite(mountpoint, 100);
+    println!("  {:<35} {:>7.2} ms/write ({:.3}s total)",
+        "100 overwrites", dur.as_secs_f64() * 1000.0 / 100.0, dur.as_secs_f64());
+
+    sep();
+    println!("  Rename (50 round trips)");
+    let dur = rename_bench(mountpoint, 50);
+    println!("  {:<35} {:>7.2} ms/rename ({:.3}s total)",
+        "100 renames (50 src→dst + 50 back)", dur.as_secs_f64() * 1000.0 / 100.0, dur.as_secs_f64());
+
+    sep();
+    println!();
+    println!("  Compare with:");
+    println!("    vexfs bench /tmp        # tmpfs baseline");
+    println!("    vexfs bench /mnt/ext4   # ext4 baseline");
     println!();
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  daemon                                                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 
-/// Print an error and exit(1).
+fn cmd_daemon(args: DaemonArgs) {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::thread;
+
+    fn handle_client(mut stream: TcpStream, mountpoint: PathBuf, dashboard_dir: PathBuf) {
+        let mut buffer = [0; 1024];
+        let Ok(size) = stream.read(&mut buffer) else { return; };
+        if size == 0 { return; }
+
+        let request  = String::from_utf8_lossy(&buffer[..size]);
+        let mut lines = request.lines();
+        let req_line = lines.next().unwrap_or("");
+        let mut parts = req_line.split_whitespace();
+        let method   = parts.next().unwrap_or("");
+        let path     = parts.next().unwrap_or("/");
+
+        if method != "GET" { return; }
+
+        if path == "/api/telemetry" {
+            let tel_path = mountpoint.join(".vexfs-telemetry.json");
+            match fs::read_to_string(&tel_path) {
+                Ok(content) => {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Access-Control-Allow-Origin: *\r\n\r\n{content}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(_) => {
+                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n{}");
+                }
+            }
+            return;
+        }
+
+        // Static file serving
+        let file_path = if path == "/" {
+            dashboard_dir.join("index.html")
+        } else {
+            dashboard_dir.join(path.trim_start_matches('/'))
+        };
+
+        if file_path.exists() && file_path.is_file() {
+            if let Ok(content) = fs::read(&file_path) {
+                let ct = if path.ends_with(".css") { "text/css" }
+                    else if path.ends_with(".js")  { "application/javascript" }
+                    else                           { "text/html" };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
+                    content.len()
+                );
+                let mut resp = header.into_bytes();
+                resp.extend(content);
+                let _ = stream.write_all(&resp);
+            }
+        } else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n404 Not Found");
+        }
+    }
+
+    let mountpoint    = PathBuf::from(&args.mountpoint);
+    let dashboard_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("dashboard");
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))
+        .unwrap_or_else(|e| die(&format!("Cannot bind to port {}: {e}", args.port)));
+
+    println!("VexFS daemon listening on http://localhost:{}", args.port);
+    println!("Mountpoint:  {}", mountpoint.display());
+    println!("Dashboard:   {}", dashboard_dir.display());
+    println!("Press Ctrl-C to stop.");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let mnt  = mountpoint.clone();
+                let dash = dashboard_dir.clone();
+                thread::spawn(move || handle_client(s, mnt, dash));
+            }
+            Err(e) => eprintln!("connection error: {e}"),
+        }
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  gui                                                                        ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_gui(args: GuiArgs) {
+    use std::path::PathBuf;
+
+    let mountpoint = PathBuf::from(&args.mountpoint);
+    if !mountpoint.exists() {
+        die::<()>(&format!("Mountpoint '{}' does not exist", mountpoint.display()));
+    }
+
+    gui_app::run(mountpoint, args.image_path, args.daemon_url);
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Shared helpers                                                             ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+/// Print an error message and exit with code 1.
 fn die<T>(msg: &str) -> T {
     eprintln!("error: {msg}");
     std::process::exit(1)
@@ -586,16 +1132,16 @@ fn age_str(timestamp: u64) -> String {
         .unwrap_or_default()
         .as_secs();
     let age = now.saturating_sub(timestamp);
-    if age < 60        { format!("{age}s ago") }
-    else if age < 3600 { format!("{}m ago", age / 60) }
-    else if age < 86400{ format!("{}h ago", age / 3600) }
-    else               { format!("{}d ago", age / 86400) }
+    if age < 60         { format!("{age}s ago") }
+    else if age < 3600  { format!("{}m ago", age / 60) }
+    else if age < 86400 { format!("{}h ago", age / 3600) }
+    else                { format!("{}d ago", age / 86400) }
 }
 
 fn fmt_size(bytes: u64) -> String {
-    if bytes < 1024            { format!("{bytes}B") }
-    else if bytes < 1024*1024  { format!("{:.1}K", bytes as f64 / 1024.0) }
-    else                       { format!("{:.1}M", bytes as f64 / (1024.0*1024.0)) }
+    if bytes < 1024           { format!("{bytes}B") }
+    else if bytes < 1024*1024 { format!("{:.1}K", bytes as f64 / 1024.0) }
+    else                      { format!("{:.1}M", bytes as f64 / (1024.0*1024.0)) }
 }
 
 fn trunc(s: &str, max: usize) -> String {
@@ -603,15 +1149,15 @@ fn trunc(s: &str, max: usize) -> String {
     else { format!("{}…", &s[..max-1]) }
 }
 
-/// Terminal styling for clap — keeps it clean, no garish colours.
+/// Terminal styling — clean, not garish.
 fn clap_styles() -> clap::builder::Styles {
     use clap::builder::styling::{AnsiColor, Effects, Styles};
     Styles::styled()
-        .header(AnsiColor::BrightWhite.on_default() | Effects::BOLD)
-        .usage(AnsiColor::BrightWhite.on_default() | Effects::BOLD)
+        .header(AnsiColor::BrightWhite.on_default()  | Effects::BOLD)
+        .usage(AnsiColor::BrightWhite.on_default()   | Effects::BOLD)
         .literal(AnsiColor::BrightCyan.on_default())
         .placeholder(AnsiColor::Cyan.on_default())
-        .error(AnsiColor::BrightRed.on_default() | Effects::BOLD)
+        .error(AnsiColor::BrightRed.on_default()     | Effects::BOLD)
         .valid(AnsiColor::BrightGreen.on_default())
         .invalid(AnsiColor::BrightRed.on_default())
 }

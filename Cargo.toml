@@ -9,27 +9,10 @@ license = "MIT"
 name = "vexfs"
 path = "src/lib.rs"
 
-# ── Unified CLI (replaces all scattered binaries) ─────────────────────────────
+# ── Unified CLI — the only binary you need ────────────────────────────────────
 [[bin]]
 name = "vexfs"
 path = "src/bin/vexfs.rs"
-
-# ── Internal / power-user binaries ────────────────────────────────────────────
-[[bin]]
-name = "vexfs_bench"
-path = "src/bin/vexfs_bench.rs"
-
-[[bin]]
-name = "vexfs_daemon"
-path = "src/bin/vexfs_daemon.rs"
-
-[[bin]]
-name = "vexfs_fsck"
-path = "src/bin/vexfs_fsck.rs"
-
-[[bin]]
-name = "vexfs_gui"
-path = "src/bin/vexfs_gui.rs"
 
 [dependencies]
 fuser      = "0.14"

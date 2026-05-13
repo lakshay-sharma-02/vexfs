@@ -152,7 +152,7 @@ impl VexFS {
         let mut next_inode = 2u64;
         let mut cache  = ArcCache::new(64 * 1024 * 1024);
 
-        for i in 0..1024 {
+        for i in 0..disk.inode_capacity() {
             let inode = match disk.read_inode(i) {
                 Ok(n) => n,
                 Err(_) => break,
@@ -341,7 +341,7 @@ impl VexFS {
         }
     }
 
-    fn now() -> SystemTime { SystemTime::now() }
+
 
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -892,6 +892,7 @@ impl Filesystem for VexFS {
         let mut written_len = None;
         let mut cache_to_update = None;
         let mut event_to_send = None;
+        let mut need_gc = false;
 
         if let Some(file) = self.files.get_mut(&ino) {
             let mut file_data = self.cache.get(ino).cloned().unwrap_or_default();
@@ -901,7 +902,7 @@ impl Filesystem for VexFS {
                 let name = file.name.clone();
                 let old_offset = file.data_offset;
                 self.snapshots.snapshot(ino, &name, &file_data, old_offset);
-                
+
                 if let Some(slot) = self.disk.find_free_snapshot_slot() {
                     let snap_id = self.snapshots.snapshots.get(&ino).and_then(|v| v.last()).map(|s| s.id).unwrap_or(1);
                     let mut disk_snap = crate::fs::DiskSnapshot::empty();
@@ -914,14 +915,16 @@ impl Filesystem for VexFS {
                     disk_snap.is_used = 1;
                     disk_snap.set_name(&name);
                     let _ = self.disk.write_snapshot(slot, &disk_snap);
-                    
+
                     if let Some(snaps) = self.snapshots.snapshots.get_mut(&ino) {
                         if let Some(s) = snaps.last_mut() {
                             s.disk_slot = slot;
                         }
                     }
                 }
-                self.maybe_gc_snapshots();
+                // Cannot call maybe_gc_snapshots() here — `file` is still borrowed.
+                // Set flag; call after the block exits.
+                need_gc = true;
             }
 
             if offset + data.len() > file_data.len() {
@@ -941,6 +944,8 @@ impl Filesystem for VexFS {
                 data: data.to_vec(),
             });
         }
+        // `file` borrow dropped here — safe to call
+        if need_gc { self.maybe_gc_snapshots(); }
 
         if let (Some(len), Some(data), Some(event)) = (written_len, cache_to_update, event_to_send) {
             self.cache_insert(ino, data);
@@ -1034,7 +1039,7 @@ impl Filesystem for VexFS {
                 if file.data_offset > 0 && file.attr.size > 0 {
                     self.disk.free_data(file.data_offset, file.attr.size);
                 }
-                self.disk.free_inode(file.disk_index);
+                let _ = self.disk.free_inode(file.disk_index);
                 self.cache.remove(btval.ino);
                 let _ = self.ai_tx.send(FsEvent::Delete {
                     ino: btval.ino,
@@ -1101,7 +1106,7 @@ impl Filesystem for VexFS {
         if is_dir {
             self.index.remove(&name_str);
             if let Some(file) = self.files.remove(&ino) {
-                self.disk.free_inode(file.disk_index);
+                let _ = self.disk.free_inode(file.disk_index);
                 reply.ok();
             } else {
                 reply.error(ENOENT);
@@ -1146,6 +1151,7 @@ impl Filesystem for VexFS {
 
         let mut attr_to_reply = None;
         let mut cache_to_update = None;
+        let mut need_gc = false;
 
         if let Some(file) = self.files.get_mut(&ino) {
             if let Some(s) = size {
@@ -1174,7 +1180,8 @@ impl Filesystem for VexFS {
                             }
                         }
                     }
-                    self.maybe_gc_snapshots();
+                    // Defer GC until after `file` borrow is released
+                    need_gc = true;
 
                     file.attr.size = s;
                     file.dirty = true;
@@ -1186,6 +1193,8 @@ impl Filesystem for VexFS {
             }
             attr_to_reply = Some(file.attr);
         }
+        // `file` borrow dropped here — safe to call
+        if need_gc { self.maybe_gc_snapshots(); }
 
         if let Some(data) = cache_to_update {
             self.cache_insert(ino, data);
