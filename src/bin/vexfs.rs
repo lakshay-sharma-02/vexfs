@@ -22,7 +22,7 @@
 //! │  TOOLS                                                          │
 //! │    vexfs bench  <mountpoint>              Performance benchmark │
 //! │    vexfs daemon <mountpoint> [port]       Telemetry HTTP server │
-//! │    vexfs gui    <mountpoint> [image] [url] egui desktop app     │
+//! │    vexfs gui    <image> [--port PORT]     ONE-CLICK launcher    │
 //! └─────────────────────────────────────────────────────────────────┘
 
 // Pull in the GUI module (kept separate to manage its size).
@@ -83,7 +83,7 @@ enum Command {
     /// Start the telemetry HTTP server (feeds the GUI dashboard)
     Daemon(DaemonArgs),
 
-    /// Launch the egui desktop file explorer
+    /// ONE-CLICK launcher: auto-mounts image, starts daemon, opens GUI
     Gui(GuiArgs),
 }
 
@@ -174,13 +174,20 @@ struct DaemonArgs {
 
 #[derive(Args)]
 struct GuiArgs {
-    /// VexFS mountpoint (must be already mounted)
-    mountpoint: String,
-    /// Path to the VexFS disk image (enables snapshot restore from GUI)
-    image_path: Option<String>,
-    /// Telemetry daemon URL (default: http://localhost:8080)
-    #[arg(default_value = "http://localhost:8080")]
-    daemon_url: String,
+    /// Path to the VexFS disk image — the ONLY required argument now
+    image: String,
+
+    /// Mount point override (default: ~/.vexfs/mnt)
+    #[arg(long)]
+    mountpoint: Option<String>,
+
+    /// Telemetry daemon port (default: 8080)
+    #[arg(long, default_value = "8080")]
+    port: String,
+
+    /// Skip auto-mount (assume already mounted externally)
+    #[arg(long)]
+    no_mount: bool,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
@@ -285,7 +292,6 @@ fn cmd_fsck(args: FsckArgs) {
 
     let disk_size = dm.superblock.total_blocks * dm.superblock.block_size as u64;
 
-    // ── Shared report state ────────────────────────────────────────────────
     let mut valid_inodes     = 0usize;
     let mut corrupt_inodes   = 0usize;
     let mut orphaned_inodes  = 0usize;
@@ -295,7 +301,6 @@ fn cmd_fsck(args: FsckArgs) {
     let mut errors:   Vec<String> = vec![];
     let mut warnings: Vec<String> = vec![];
 
-    // ── Pass 1: inode table ───────────────────────────────────────────────
     println!("  Pass 1: scanning inode table ({} slots)…", MAX_FILES);
 
     let mut seen_names:   std::collections::HashMap<String, usize> = Default::default();
@@ -319,15 +324,6 @@ fn cmd_fsck(args: FsckArgs) {
         if name.is_empty() {
             orphaned_inodes += 1;
             warnings.push(format!("slot {i}: is_used=1 but name is empty/invalid"));
-
-            if args.repair {
-                let mut _empty = vexfs::fs::disk::InodeRaw::empty();
-                _empty.is_used = 0;
-                // Wait, DiskInode doesn't exist, it's InodeRaw or something. 
-                // Let's use whatever DiskManager uses.
-                // In mkfs, we use DiskManager::format. 
-                // Let's just zero it.
-            }
             continue;
         }
 
@@ -369,7 +365,6 @@ fn cmd_fsck(args: FsckArgs) {
     println!("    {} slots scanned, {} valid, {} corrupt, {} orphaned",
         MAX_FILES, valid_inodes, corrupt_inodes, orphaned_inodes);
 
-    // ── Pass 2: free list ─────────────────────────────────────────────────
     println!("  Pass 2: checking free list…");
 
     let current_free  = dm.free_list.total_free_bytes();
@@ -391,7 +386,6 @@ fn cmd_fsck(args: FsckArgs) {
         println!("    free list looks correct ({current_free} bytes free)");
     }
 
-    // ── Pass 3: superblock ────────────────────────────────────────────────
     println!("  Pass 3: checking superblock…");
 
     if dm.superblock.magic != MAGIC {
@@ -419,7 +413,6 @@ fn cmd_fsck(args: FsckArgs) {
     println!("    superblock: magic OK, version {}, {} total blocks",
         dm.superblock.version, dm.superblock.total_blocks);
 
-    // ── Pass 4: snapshot table ────────────────────────────────────────────
     println!("  Pass 4: checking snapshot table…");
 
     let mut valid_snaps   = 0usize;
@@ -445,7 +438,6 @@ fn cmd_fsck(args: FsckArgs) {
 
     println!("    {valid_snaps} valid snapshots, {corrupt_snaps} corrupt slots");
 
-    // ── Summary ───────────────────────────────────────────────────────────
     println!();
     println!("  ┌─────────────────────────────────────┐");
     println!("  │          fsck Summary                │");
@@ -861,8 +853,6 @@ fn cmd_bench(args: BenchArgs) {
         std::process::exit(1);
     }
 
-    // ── Inner helpers (defined locally to avoid polluting the module) ─────
-
     fn sep() { println!("{}", "─".repeat(60)); }
 
     fn print_result(name: &str, elapsed: Duration, bytes: usize) {
@@ -956,8 +946,6 @@ fn cmd_bench(args: BenchArgs) {
         elapsed
     }
 
-    // ── Run suite ─────────────────────────────────────────────────────────
-
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║            VexFS Performance Benchmark                   ║");
@@ -1050,7 +1038,6 @@ fn cmd_daemon(args: DaemonArgs) {
             return;
         }
 
-        // Static file serving
         let file_path = if path == "/" {
             dashboard_dir.join("index.html")
         } else {
@@ -1085,7 +1072,6 @@ fn cmd_daemon(args: DaemonArgs) {
 
     println!("VexFS daemon listening on http://localhost:{}", args.port);
     println!("Mountpoint:  {}", mountpoint.display());
-    println!("Dashboard:   {}", dashboard_dir.display());
     println!("Press Ctrl-C to stop.");
 
     for stream in listener.incoming() {
@@ -1101,25 +1087,246 @@ fn cmd_daemon(args: DaemonArgs) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  gui                                                                        ║
+// ║  gui  —  ONE-CLICK LAUNCHER                                                  ║
+// ║                                                                              ║
+// ║  Lifecycle:                                                                  ║
+// ║    1. Resolve / create mount point (~/.vexfs/mnt by default)                 ║
+// ║    2. Ensure image is formatted (offer mkfs if not)                          ║
+// ║    3. Mount image via FUSE in a background thread                            ║
+// ║    4. Start telemetry daemon in a background thread                          ║
+// ║    5. Wait briefly for FUSE to become ready                                  ║
+// ║    6. Launch egui window                                                     ║
+// ║    7. On GUI exit → unmount + stop daemon                                    ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_gui(args: GuiArgs) {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::{fs, thread};
 
-    let mountpoint = PathBuf::from(&args.mountpoint);
+    // ── Step 1: resolve mount point ────────────────────────────────────────
+    let mountpoint: PathBuf = match &args.mountpoint {
+        Some(m) => PathBuf::from(m),
+        None => {
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            home.join(".vexfs").join("mnt")
+        }
+    };
+
     if !mountpoint.exists() {
-        die::<()>(&format!("Mountpoint '{}' does not exist", mountpoint.display()));
+        fs::create_dir_all(&mountpoint).unwrap_or_else(|e| {
+            die::<()>(&format!("Cannot create mount point '{}': {e}", mountpoint.display()));
+        });
+        println!("✓ Created mount point: {}", mountpoint.display());
     }
 
-    gui_app::run(mountpoint, args.image_path, args.daemon_url);
+    // ── Step 2: check / format image ──────────────────────────────────────
+    let image_path = PathBuf::from(&args.image);
+
+    if !image_path.exists() {
+        println!("Image '{}' not found.", image_path.display());
+        println!("Creating a new 128 MB VexFS image…");
+
+        use std::fs::File;
+        let file = File::create(&image_path)
+            .unwrap_or_else(|e| die(&format!("Cannot create image: {e}")));
+        file.set_len(128 * 1024 * 1024)
+            .unwrap_or_else(|e| die(&format!("Cannot set image size: {e}")));
+
+        use vexfs::fs::DiskManager;
+        let mut disk = DiskManager::format(&args.image, 128 * 1024 * 1024)
+            .unwrap_or_else(|e| die(&format!("Format failed: {e}")));
+        disk.flush()
+            .unwrap_or_else(|e| die(&format!("Flush failed: {e}")));
+
+        println!("✓ Created and formatted: {}", image_path.display());
+    } else {
+        println!("✓ Image: {}", image_path.display());
+    }
+
+    // ── Step 3: mount in background thread ────────────────────────────────
+    let mounted = Arc::new(AtomicBool::new(false));
+
+    if !args.no_mount {
+        // Check if already mounted by probing the magic telemetry file
+        let tel_probe = mountpoint.join(".vexfs-telemetry.json");
+        let already_mounted = tel_probe.exists();
+
+        if already_mounted {
+            println!("✓ Already mounted at {}", mountpoint.display());
+            mounted.store(true, Ordering::Relaxed);
+        } else {
+            let image_for_mount = args.image.clone();
+            let mnt_for_mount   = mountpoint.clone();
+            let mounted_flag    = Arc::clone(&mounted);
+
+            println!("  Mounting {} → {}…", image_for_mount, mnt_for_mount.display());
+
+            thread::spawn(move || {
+                use fuser::MountOption;
+                use vexfs::fuse::VexFS;
+                use vexfs::fs::DiskManager;
+
+                let disk = match DiskManager::open(&image_for_mount) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("Mount thread: cannot open image: {e}");
+                        return;
+                    }
+                };
+
+                let fs = VexFS::load(disk, &image_for_mount);
+                mounted_flag.store(true, Ordering::Relaxed);
+
+                if let Err(e) = fuser::mount2(fs, &mnt_for_mount, &[
+                    MountOption::RW,
+                    MountOption::FSName("vexfs".to_string()),
+                ]) {
+                    eprintln!("FUSE mount error: {e}");
+                    mounted_flag.store(false, Ordering::Relaxed);
+                }
+            });
+
+            // Wait up to 3 seconds for mount to become ready
+            for attempt in 0..30 {
+                thread::sleep(Duration::from_millis(100));
+                if mounted.load(Ordering::Relaxed) {
+                    // Give FUSE a moment to register the root directory
+                    thread::sleep(Duration::from_millis(200));
+                    break;
+                }
+                if attempt == 29 {
+                    eprintln!("warning: mount did not confirm within 3s — proceeding anyway");
+                }
+            }
+
+            println!("✓ Mounted at {}", mountpoint.display());
+        }
+    } else {
+        println!("  Skipping auto-mount (--no-mount flag set)");
+        mounted.store(true, Ordering::Relaxed);
+    }
+
+    // ── Step 4: start telemetry daemon in background ───────────────────────
+    let daemon_url = format!("http://localhost:{}", args.port);
+    let port_str   = args.port.clone();
+    let mnt_for_daemon = mountpoint.clone();
+
+    // Try to bind the port; if it fails, the daemon may already be running
+    {
+        use std::net::TcpListener;
+        match TcpListener::bind(format!("0.0.0.0:{port_str}")) {
+            Ok(listener) => {
+                // Bind succeeded — spawn the daemon
+                drop(listener); // release the port so the daemon thread can bind
+                let dashboard_dir = std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("dashboard");
+
+                thread::spawn(move || {
+                    run_daemon_thread(mnt_for_daemon, port_str, dashboard_dir);
+                });
+
+                println!("✓ Telemetry daemon started on {daemon_url}");
+            }
+            Err(_) => {
+                println!("✓ Daemon already running on {daemon_url}");
+            }
+        }
+    }
+
+    // ── Step 5: brief settle delay ─────────────────────────────────────────
+    thread::sleep(Duration::from_millis(300));
+
+    // ── Step 6: launch GUI ────────────────────────────────────────────────
+    println!("\n  Launching VexFS Explorer…\n");
+
+    let image_path_str = args.image.clone();
+    gui_app::run(mountpoint.clone(), Some(image_path_str), daemon_url);
+
+    // ── Step 7: teardown on GUI exit ──────────────────────────────────────
+    if !args.no_mount && mounted.load(Ordering::Relaxed) {
+        println!("\n  Unmounting {}…", mountpoint.display());
+        let mnt_str = mountpoint.to_string_lossy().to_string();
+        let _ = std::process::Command::new("fusermount")
+            .args(["-u", &mnt_str])
+            .status();
+        println!("  Goodbye.");
+    }
+}
+
+/// Inner daemon loop — runs in a background thread spawned by cmd_gui.
+fn run_daemon_thread(
+    mountpoint: std::path::PathBuf,
+    port: String,
+    dashboard_dir: std::path::PathBuf,
+) {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn handle(mut stream: TcpStream, mountpoint: std::path::PathBuf, dashboard_dir: std::path::PathBuf) {
+        let mut buf = [0u8; 2048];
+        let Ok(n) = stream.read(&mut buf) else { return; };
+        if n == 0 { return; }
+
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let first = req.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        let _method = parts.next().unwrap_or("");
+        let path    = parts.next().unwrap_or("/");
+
+        if path == "/api/telemetry" {
+            let tel = mountpoint.join(".vexfs-telemetry.json");
+            let body = fs::read_to_string(&tel).unwrap_or_else(|_| "{}".into());
+            let _ = stream.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                         body.len(), body).as_bytes()
+            );
+            return;
+        }
+
+        let file_path = if path == "/" {
+            dashboard_dir.join("index.html")
+        } else {
+            dashboard_dir.join(path.trim_start_matches('/'))
+        };
+
+        if file_path.exists() {
+            if let Ok(content) = fs::read(&file_path) {
+                let ct = if path.ends_with(".css") { "text/css" }
+                         else if path.ends_with(".js") { "application/javascript" }
+                         else { "text/html" };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
+                    content.len()
+                );
+                let mut resp = header.into_bytes();
+                resp.extend(content);
+                let _ = stream.write_all(&resp);
+            }
+        } else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
+        }
+    }
+
+    let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{port}")) else { return; };
+    for stream in listener.incoming().flatten() {
+        let mnt  = mountpoint.clone();
+        let dash = dashboard_dir.clone();
+        std::thread::spawn(move || handle(stream, mnt, dash));
+    }
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║  Shared helpers                                                             ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
-/// Print an error message and exit with code 1.
 fn die<T>(msg: &str) -> T {
     eprintln!("error: {msg}");
     std::process::exit(1)
@@ -1149,7 +1356,6 @@ fn trunc(s: &str, max: usize) -> String {
     else { format!("{}…", &s[..max-1]) }
 }
 
-/// Terminal styling — clean, not garish.
 fn clap_styles() -> clap::builder::Styles {
     use clap::builder::styling::{AnsiColor, Effects, Styles};
     Styles::styled()
