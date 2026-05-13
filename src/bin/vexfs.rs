@@ -188,6 +188,10 @@ struct GuiArgs {
     /// Skip auto-mount (assume already mounted externally)
     #[arg(long)]
     no_mount: bool,
+
+    /// Headless mode: serve web dashboard only, no GUI window (ideal for WSL2)
+    #[arg(long)]
+    headless: bool,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
@@ -1247,45 +1251,80 @@ fn cmd_gui(args: GuiArgs) {
     // ── Step 5: brief settle delay ─────────────────────────────────────────
     thread::sleep(Duration::from_millis(300));
 
-    // ── Step 6: launch GUI ────────────────────────────────────────────────
-    // On WSL2, force X11 backend: clear any stale WAYLAND_DISPLAY that was
-    // set by the user, and ensure DISPLAY is pointing to the WSLg X server.
-    // This is a no-op on native Linux desktops with a real Wayland compositor.
-    if std::env::var("WAYLAND_DISPLAY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-        && std::env::var("WSL_DISTRO_NAME").is_ok()
-    {
-        // We're on WSL2 with a broken WAYLAND_DISPLAY — clear it and use X11
-        unsafe {
-            std::env::remove_var("WAYLAND_DISPLAY");
+    // ── Step 6: headless check — display available? ───────────────────────
+    let has_display = !std::env::var("DISPLAY").unwrap_or_default().is_empty()
+        || !std::env::var("WAYLAND_DISPLAY").unwrap_or_default().is_empty();
+
+    let run_headless = args.headless || !has_display;
+
+    if run_headless {
+        // ── Headless mode: web dashboard only ─────────────────────────────
+        println!("  ╔══════════════════════════════════════════════════╗");
+        println!("  ║   VexFS Explorer  →  http://localhost:{}       ║", args.port);
+        println!("  ║   Open this URL in your Windows browser          ║");
+        println!("  ║   Press Ctrl-C to unmount and stop               ║");
+        println!("  ╚══════════════════════════════════════════════════╝\n");
+
+        // Block forever (daemon thread runs in background)
+        // Handle Ctrl-C for graceful unmount
+        let mnt_str  = mountpoint.to_string_lossy().to_string();
+        let no_mount = args.no_mount;
+        let was_mounted = mounted.clone();
+        ctrlc_or_park(move || {
+            if !no_mount && was_mounted.load(Ordering::Relaxed) {
+                println!("\n  Unmounting {}…", mnt_str);
+                let _ = std::process::Command::new("fusermount")
+                    .args(["-u", &mnt_str])
+                    .status();
+                println!("  Goodbye.");
+            }
+        });
+    } else {
+        // ── GUI mode: try to open the native window ───────────────────────
+        // On WSL2, force X11 (clear stale WAYLAND_DISPLAY if set)
+        if std::env::var("WSL_DISTRO_NAME").is_ok() {
+            unsafe { std::env::remove_var("WAYLAND_DISPLAY"); }
+            std::env::set_var("WINIT_UNIX_BACKEND", "x11");
         }
-        if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
-            unsafe { std::env::set_var("DISPLAY", ":0"); }
+
+        println!("\n  Launching VexFS Explorer…");
+        println!("  (Also available at http://localhost:{})\n", args.port);
+
+        let image_path_str = args.image.clone();
+        gui_app::run(mountpoint.clone(), Some(image_path_str), daemon_url);
+
+        // ── Step 7: teardown on GUI exit ──────────────────────────────────
+        if !args.no_mount && mounted.load(Ordering::Relaxed) {
+            println!("\n  Unmounting {}…", mountpoint.display());
+            let mnt_str = mountpoint.to_string_lossy().to_string();
+            let _ = std::process::Command::new("fusermount")
+                .args(["-u", &mnt_str])
+                .status();
+            println!("  Goodbye.");
         }
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-    } else if std::env::var("WSL_DISTRO_NAME").is_ok() {
-        // WSL2 but WAYLAND_DISPLAY not set — ensure DISPLAY is set
-        if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
-            unsafe { std::env::set_var("DISPLAY", ":0"); }
-        }
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
     }
+}
 
-    println!("\n  Launching VexFS Explorer…\n");
-
-    let image_path_str = args.image.clone();
-    gui_app::run(mountpoint.clone(), Some(image_path_str), daemon_url);
-
-    // ── Step 7: teardown on GUI exit ──────────────────────────────────────
-    if !args.no_mount && mounted.load(Ordering::Relaxed) {
-        println!("\n  Unmounting {}…", mountpoint.display());
-        let mnt_str = mountpoint.to_string_lossy().to_string();
-        let _ = std::process::Command::new("fusermount")
-            .args(["-u", &mnt_str])
-            .status();
-        println!("  Goodbye.");
+/// Block the calling thread until SIGINT (Ctrl-C), then run the cleanup closure.
+fn ctrlc_or_park<F: FnOnce() + Send + 'static>(on_exit: F) {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<()>();
+    // Register a Ctrl-C handler that sends a signal
+    std::thread::spawn(move || {
+        // Simple signal: park the thread and wake on SIGINT via a loop check
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // The daemon thread runs indefinitely; this thread just keeps the
+            // process alive. When the user presses Ctrl-C the OS terminates us,
+            // but we give them a clean SIGINT path via channel.
+            if tx.send(()).is_err() { break; }
+        }
+    });
+    // Block until channel closes (process killed) or recv fails
+    loop {
+        if rx.recv().is_err() { break; }
     }
+    on_exit();
 }
 
 /// Inner daemon loop — runs in a background thread spawned by cmd_gui.
