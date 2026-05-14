@@ -85,6 +85,9 @@ enum Command {
 
     /// ONE-CLICK launcher: auto-mounts image, starts daemon, opens GUI
     Gui(GuiArgs),
+
+    /// Manage VexFS configuration (e.g., set ai-key, ai-model)
+    Config(ConfigArgs),
 }
 
 // ── Per-command arg structs ────────────────────────────────────────────────────
@@ -194,6 +197,16 @@ struct GuiArgs {
     headless: bool,
 }
 
+#[derive(Args)]
+struct ConfigArgs {
+    /// Action: set, get
+    action: String,
+    /// Config key (e.g., ai-key, ai-model)
+    key: String,
+    /// Value (required for set)
+    value: Option<String>,
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -211,6 +224,51 @@ fn main() {
         Command::Bench(args)             => cmd_bench(args),
         Command::Daemon(args)            => cmd_daemon(args),
         Command::Gui(args)               => cmd_gui(args),
+        Command::Config(args)            => cmd_config(args),
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  config                                                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn get_config_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
+    std::path::PathBuf::from(home).join(".config").join("vexfs").join("config.json")
+}
+
+fn load_config() -> serde_json::Value {
+    let p = get_config_path();
+    if !p.exists() { return serde_json::json!({}); }
+    let data = std::fs::read_to_string(p).unwrap_or_default();
+    serde_json::from_str(&data).unwrap_or(serde_json::json!({}))
+}
+
+fn save_config(cfg: &serde_json::Value) {
+    let p = get_config_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, serde_json::to_string_pretty(cfg).unwrap());
+}
+
+fn cmd_config(args: ConfigArgs) {
+    let mut cfg = load_config();
+    match args.action.as_str() {
+        "set" => {
+            let val = args.value.unwrap_or_default();
+            cfg[args.key.clone()] = serde_json::json!(val);
+            save_config(&cfg);
+            println!("✓ Set {} = {}", args.key, val);
+        }
+        "get" => {
+            if let Some(v) = cfg.get(&args.key) {
+                println!("{}", v.as_str().unwrap_or(&v.to_string()));
+            } else {
+                println!("(not set)");
+            }
+        }
+        _ => die("Action must be 'set' or 'get'"),
     }
 }
 
@@ -1327,6 +1385,100 @@ fn ctrlc_or_park<F: FnOnce() + Send + 'static>(on_exit: F) {
     on_exit();
 }
 
+fn call_llm(query: &str, telemetry: &str, mountpoint: &std::path::PathBuf) -> String {
+    let cfg = load_config();
+    let api_key = cfg.get("ai-key").and_then(|v| v.as_str()).unwrap_or("");
+    if api_key.is_empty() {
+        return "Error: AI API key not set. Run `vexfs config set ai-key <key>` first.".into();
+    }
+
+    let model    = cfg.get("ai-model").and_then(|v| v.as_str()).unwrap_or("gemini-2.0-flash");
+    let endpoint = cfg.get("ai-endpoint").and_then(|v| v.as_str())
+        .unwrap_or("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+
+    let mut extra_context = String::new();
+    if let Ok(entries) = std::fs::read_dir(mountpoint) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if !name.starts_with(".vexfs") && query.contains(&name) {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        let snippet = if content.len() > 4000 { format!("{}... (truncated)", &content[..4000]) } else { content };
+                        extra_context.push_str(&format!("\n\n--- Contents of {} ---\n{}\n", name, snippet));
+                    }
+                }
+            }
+        }
+    }
+
+    let system_prompt = format!(
+        "You are VexFS Jarvis, an AI assistant built into the filesystem.\n\
+        Filesystem telemetry:\n{}{}\n\n\
+        Answer the user's question concisely. Be technical and precise.",
+        telemetry, extra_context
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user",   "content": query }
+        ],
+        "max_tokens": 800,
+        "temperature": 0.3,
+    });
+
+    let req = if endpoint.contains("googleapis.com") {
+        client.post(format!("{}?key={}", endpoint, api_key))
+    } else {
+        client.post(endpoint).header("Authorization", format!("Bearer {}", api_key))
+    };
+
+    let resp = match req
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", "https://vexfs.local")
+        .header("X-Title", "VexFS Explorer")
+        .json(&payload)
+        .send()
+    {
+        Ok(r)  => r,
+        Err(e) => return format!("Network error: {}", e),
+    };
+
+    // Read as raw text first — avoids failing on charset/encoding edge cases
+    let raw = match resp.text() {
+        Ok(t)  => t,
+        Err(e) => return format!("Failed to read response: {}", e),
+    };
+
+    // Parse JSON — handle both object {} and Google's array-wrapped [{}] formats
+    let json: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return format!("Non-JSON response (first 200 chars): {}", &raw[..raw.len().min(200)]),
+    };
+
+    // Unwrap array wrapper if present (Google sometimes returns [{...}])
+    let obj = match json.as_array() {
+        Some(arr) => arr.first().cloned().unwrap_or_else(|| json.clone()),
+        None => json.clone(),
+    };
+
+    // Standard OpenAI choices path
+    if let Some(content) = obj["choices"][0]["message"]["content"].as_str() {
+        return content.to_string();
+    }
+    // Error message path
+    if let Some(err) = obj["error"]["message"].as_str() {
+        return format!("API Error: {}", err);
+    }
+
+    format!("Unexpected response: {}", &raw[..raw.len().min(300)])
+}
+
 /// Inner daemon loop — runs in a background thread spawned by cmd_gui.
 fn run_daemon_thread(
     mountpoint: std::path::PathBuf,
@@ -1487,17 +1639,16 @@ fn run_daemon_thread(
             return;
         }
 
-        // ── /api/ask  — AI question ───────────────────────────────────────
+// ── /api/ask  — AI question (Real LLM integration) ────────────────────────
         if path == "/api/ask" && method == "POST" {
-            let ask_path = mountpoint.join(".vexfs-ask");
-            let result = (|| -> Option<String> {
-                fs::write(&ask_path, body_str.trim().as_bytes()).ok()?;
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                let out = fs::read_to_string(&ask_path).ok()?;
-                Some(out)
-            })().unwrap_or_default();
+            let q = body_str.trim().to_string();
+            let tel_path = mountpoint.join(".vexfs-telemetry.json");
+            let tel_data = fs::read_to_string(&tel_path).unwrap_or_else(|_| "{}".to_string());
+            
+            // Block and wait for OpenRouter response
+            let answer = call_llm(&q, &tel_data, &mountpoint);
             json_ok(&mut stream,
-                &format!("{{\"result\":\"{}\"}}", escape_json(result.trim())));
+                &format!("{{\"result\":\"{}\"}}", escape_json(&answer)));
             return;
         }
 
