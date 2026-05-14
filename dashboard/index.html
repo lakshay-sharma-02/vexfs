@@ -258,9 +258,17 @@
     <!-- NEW FILE DIALOG -->
     <div class="overlay" id="dialog-new-file">
         <div class="glass-card dialog">
-            <h3 style="margin-top: 0;">Create New File</h3>
+            <h3 style="margin-top: 0;">Create New Item</h3>
+            <div class="input-group" style="display: flex; gap: 16px; margin-bottom: 16px;">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text);">
+                    <input type="radio" name="new-type" id="new-type-file" value="file" checked onchange="document.getElementById('new-filename').placeholder='e.g. config.json'"> File
+                </label>
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text);">
+                    <input type="radio" name="new-type" id="new-type-dir" value="dir" onchange="document.getElementById('new-filename').placeholder='e.g. src'"> Directory
+                </label>
+            </div>
             <div class="input-group">
-                <label>Filename</label>
+                <label>Name</label>
                 <input type="text" id="new-filename" placeholder="e.g. config.json">
             </div>
             <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px;">
@@ -394,11 +402,18 @@
         }
         async function createFile() {
             const name = document.getElementById('new-filename').value.trim();
+            const isDir = document.getElementById('new-type-dir').checked;
             if (!name) return;
             try {
-                await fetch('/api/file/' + encodeURIComponent(name), { method: 'POST', body: '' });
-                closeDialogs();
-                openFile(name);
+                if (isDir) {
+                    await fetch('/api/dir/' + encodeURIComponent(name), { method: 'POST', body: '' });
+                    closeDialogs();
+                    loadFiles();
+                } else {
+                    await fetch('/api/file/' + encodeURIComponent(name), { method: 'POST', body: '' });
+                    closeDialogs();
+                    openFile(name);
+                }
             } catch (e) {
                 console.error(e);
             }

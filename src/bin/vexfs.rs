@@ -2,28 +2,39 @@
 //!
 //! Usage mirrors git: `vexfs <command> [subcommand] [args]`
 //!
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │  FILESYSTEM                                                     │
-//! │    vexfs mkfs  <image> [size_mb]         Format a disk image    │
-//! │    vexfs mount <image> <mountpoint>       Mount via FUSE        │
-//! │    vexfs fsck  <image> [--repair]         Check / repair        │
-//! │                                                                 │
-//! │  INTELLIGENCE                                                   │
-//! │    vexfs search <image> <query…>          TF-IDF search         │
-//! │    vexfs status <image> [query…]          AI dashboard          │
-//! │    vexfs info   <image> <filename>        Per-file deep-dive    │
-//! │                                                                 │
-//! │  SNAPSHOTS                                                      │
-//! │    vexfs snapshot all     <image>         List all snapshots    │
-//! │    vexfs snapshot list    <image> <file>  List file versions    │
-//! │    vexfs snapshot restore <image> <file> <version>              │
-//! │    vexfs snapshot gc      <image> [keep]  Garbage-collect       │
-//! │                                                                 │
-//! │  TOOLS                                                          │
-//! │    vexfs bench  <mountpoint>              Performance benchmark │
-//! │    vexfs daemon <mountpoint> [port]       Telemetry HTTP server │
-//! │    vexfs gui    <image> [--port PORT]     ONE-CLICK launcher    │
-//! └─────────────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │  FILESYSTEM                                                         │
+//! │    vexfs mkfs   <image> [size_mb]          Format a disk image      │
+//! │    vexfs mount  <image> <mountpoint>        Mount via FUSE          │
+//! │    vexfs fsck   <image> [--repair]          Check / repair          │
+//! │                                                                     │
+//! │  INTELLIGENCE                                                       │
+//! │    vexfs search <image> <query…>            TF-IDF search           │
+//! │    vexfs status <image> [query…]            AI dashboard            │
+//! │    vexfs info   <image> <filename>          Per-file deep-dive      │
+//! │                                                                     │
+//! │  SNAPSHOTS                                                          │
+//! │    vexfs snapshot all     <image>           List all snapshots      │
+//! │    vexfs snapshot list    <image> <file>    List file versions      │
+//! │    vexfs snapshot restore <image> <file> <version>                  │
+//! │    vexfs snapshot gc      <image> [keep]    Garbage-collect         │
+//! │                                                                     │
+//! │  ADVANCED (VexFS-exclusive)                                         │
+//! │    vexfs tree   <image> [depth] [--tiers] [--sizes]                 │
+//! │                                             Visual directory tree   │
+//! │    vexfs find   <image> <pattern> [--regex] [--min-size N]          │
+//! │                                             Filesystem-wide search  │
+//! │    vexfs heat   <image> [--top N]           AI usage heatmap        │
+//! │    vexfs diff   <image> <file> [v1] [v2]    Snapshot diff viewer    │
+//! │    vexfs tag    <image> <file> <tag|list>   AI-powered file tagging │
+//! │    vexfs graph  <image> [--max-edges N]     Markov access graph     │
+//! │                                                                     │
+//! │  TOOLS                                                              │
+//! │    vexfs bench  <mountpoint>                Performance benchmark   │
+//! │    vexfs daemon <mountpoint> [port]         Telemetry HTTP server   │
+//! │    vexfs gui    <image> [--port PORT]       ONE-CLICK launcher      │
+//! │    vexfs config set|get <key> [value]       Configuration           │
+//! └─────────────────────────────────────────────────────────────────────┘
 
 // Pull in the GUI module (kept separate to manage its size).
 #[path = "gui_app.rs"]
@@ -31,7 +42,7 @@ mod gui_app;
 
 use clap::{Parser, Subcommand, Args};
 
-// ── Top-level CLI ──────────────────────────────────────────────────────────────
+// ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -52,20 +63,16 @@ enum Command {
     // ── Filesystem ────────────────────────────────────────────────────────
     /// Format a raw disk image as VexFS
     Mkfs(MkfsArgs),
-
     /// Mount a VexFS image via FUSE
     Mount(MountArgs),
-
     /// Check filesystem integrity, optionally repair errors
     Fsck(FsckArgs),
 
     // ── Intelligence ──────────────────────────────────────────────────────
     /// Semantic (TF-IDF) search over file contents
     Search(SearchArgs),
-
     /// AI status dashboard — tiers, importance scores, access patterns
     Status(StatusArgs),
-
     /// Per-file deep-dive: size, tier, score, snapshot history
     Info(InfoArgs),
 
@@ -76,21 +83,32 @@ enum Command {
         action: SnapshotAction,
     },
 
+    // ── VexFS-exclusive advanced commands ────────────────────────────────
+    /// Visual directory tree (like `tree`, but AI-annotated)
+    Tree(TreeArgs),
+    /// Find files by name pattern anywhere in the filesystem
+    Find(FindArgs),
+    /// AI heatmap: usage intensity per file
+    Heat(HeatArgs),
+    /// Line-by-line diff between two snapshot versions of a file
+    Diff(DiffArgs),
+    /// AI-powered file tagging (add or list tags)
+    Tag(TagArgs),
+    /// Markov access-pattern graph (text visualisation)
+    Graph(GraphArgs),
+
     // ── Tools ─────────────────────────────────────────────────────────────
     /// Run performance benchmarks against a mounted path
     Bench(BenchArgs),
-
     /// Start the telemetry HTTP server (feeds the GUI dashboard)
     Daemon(DaemonArgs),
-
     /// ONE-CLICK launcher: auto-mounts image, starts daemon, opens GUI
     Gui(GuiArgs),
-
-    /// Manage VexFS configuration (e.g., set ai-key, ai-model)
+    /// Manage VexFS configuration (e.g. set ai-key, ai-model)
     Config(ConfigArgs),
 }
 
-// ── Per-command arg structs ────────────────────────────────────────────────────
+// ── Per-command arg structs ───────────────────────────────────────────────────
 
 #[derive(Args)]
 struct MkfsArgs {
@@ -160,6 +178,85 @@ enum SnapshotAction {
     },
 }
 
+// ── Advanced command arg structs ─────────────────────────────────────────────
+
+#[derive(Args)]
+struct TreeArgs {
+    /// VexFS disk image
+    image: String,
+    /// Maximum depth (0 = unlimited)
+    #[arg(default_value_t = 0)]
+    depth: usize,
+    /// Show AI tier badges (🔥/🌤/🧊) next to each file
+    #[arg(long)]
+    tiers: bool,
+    /// Show file sizes
+    #[arg(long)]
+    sizes: bool,
+}
+
+#[derive(Args)]
+struct FindArgs {
+    /// VexFS disk image
+    image: String,
+    /// Pattern to match against file names (substring, or regex with --regex)
+    pattern: String,
+    /// Treat pattern as a regex (supports ^ $ .*)
+    #[arg(long)]
+    regex: bool,
+    /// Minimum file size in bytes (0 = no minimum)
+    #[arg(long, default_value_t = 0)]
+    min_size: u64,
+    /// Only show files, not directories
+    #[arg(long)]
+    files_only: bool,
+    /// Only show directories
+    #[arg(long)]
+    dirs_only: bool,
+}
+
+#[derive(Args)]
+struct HeatArgs {
+    /// VexFS disk image
+    image: String,
+    /// Number of files to show
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    /// VexFS disk image
+    image: String,
+    /// File to diff
+    filename: String,
+    /// First snapshot version (defaults to latest snapshot)
+    v1: Option<u32>,
+    /// Second snapshot version (defaults to current working copy)
+    v2: Option<u32>,
+}
+
+#[derive(Args)]
+struct TagArgs {
+    /// VexFS disk image
+    image: String,
+    /// File to tag
+    filename: String,
+    /// Tag to add, or "list" to show existing tags
+    tag: String,
+}
+
+#[derive(Args)]
+struct GraphArgs {
+    /// VexFS disk image
+    image: String,
+    /// Maximum edges to show per node
+    #[arg(long, default_value_t = 3)]
+    max_edges: usize,
+}
+
+// ── Tool arg structs ─────────────────────────────────────────────────────────
+
 #[derive(Args)]
 struct BenchArgs {
     /// Mountpoint or directory to benchmark
@@ -179,19 +276,15 @@ struct DaemonArgs {
 struct GuiArgs {
     /// Path to the VexFS disk image — the ONLY required argument now
     image: String,
-
     /// Mount point override (default: ~/.vexfs/mnt)
     #[arg(long)]
     mountpoint: Option<String>,
-
     /// Telemetry daemon port (default: 8080)
     #[arg(long, default_value = "8080")]
     port: String,
-
     /// Skip auto-mount (assume already mounted externally)
     #[arg(long)]
     no_mount: bool,
-
     /// Headless mode: serve web dashboard only, no GUI window (ideal for WSL2)
     #[arg(long)]
     headless: bool,
@@ -201,30 +294,36 @@ struct GuiArgs {
 struct ConfigArgs {
     /// Action: set, get
     action: String,
-    /// Config key (e.g., ai-key, ai-model)
+    /// Config key (e.g. ai-key, ai-model)
     key: String,
     /// Value (required for set)
     value: Option<String>,
 }
 
-// ── Entry point ────────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Mkfs(args)              => cmd_mkfs(args),
-        Command::Mount(args)             => cmd_mount(args),
-        Command::Fsck(args)              => cmd_fsck(args),
-        Command::Search(args)            => cmd_search(args),
-        Command::Status(args)            => cmd_status(args),
-        Command::Info(args)              => cmd_info(args),
-        Command::Snapshot { action }     => cmd_snapshot(action),
-        Command::Bench(args)             => cmd_bench(args),
-        Command::Daemon(args)            => cmd_daemon(args),
-        Command::Gui(args)               => cmd_gui(args),
-        Command::Config(args)            => cmd_config(args),
+        Command::Mkfs(args)          => cmd_mkfs(args),
+        Command::Mount(args)         => cmd_mount(args),
+        Command::Fsck(args)          => cmd_fsck(args),
+        Command::Search(args)        => cmd_search(args),
+        Command::Status(args)        => cmd_status(args),
+        Command::Info(args)          => cmd_info(args),
+        Command::Snapshot { action } => cmd_snapshot(action),
+        Command::Tree(args)          => cmd_tree(args),
+        Command::Find(args)          => cmd_find(args),
+        Command::Heat(args)          => cmd_heat(args),
+        Command::Diff(args)          => cmd_diff(args),
+        Command::Tag(args)           => cmd_tag(args),
+        Command::Graph(args)         => cmd_graph(args),
+        Command::Bench(args)         => cmd_bench(args),
+        Command::Daemon(args)        => cmd_daemon(args),
+        Command::Gui(args)           => cmd_gui(args),
+        Command::Config(args)        => cmd_config(args),
     }
 }
 
@@ -246,9 +345,7 @@ fn load_config() -> serde_json::Value {
 
 fn save_config(cfg: &serde_json::Value) {
     let p = get_config_path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
     let _ = std::fs::write(p, serde_json::to_string_pretty(cfg).unwrap());
 }
 
@@ -378,22 +475,21 @@ fn cmd_fsck(args: FsckArgs) {
                 continue;
             }
         };
-
         if inode.is_used == 0 { continue; }
-
         let name = inode.get_name();
-
         if name.is_empty() {
             orphaned_inodes += 1;
             warnings.push(format!("slot {i}: is_used=1 but name is empty/invalid"));
             continue;
         }
-
         valid_inodes += 1;
 
-        if let Some(prev) = seen_names.insert(name.clone(), i) {
+        // Duplicate name check is now scoped per-directory.
+        let scoped_key = format!("{}:{}", inode.get_parent_ino(), name);
+        if let Some(prev) = seen_names.insert(scoped_key.clone(), i) {
             duplicate_names += 1;
-            errors.push(format!("duplicate name '{name}' in slots {prev} and {i}"));
+            errors.push(format!("duplicate '{}' (parent={}) in slots {prev} and {i}",
+                name, inode.get_parent_ino()));
         }
         if let Some(prev) = seen_inos.insert(inode.ino, i) {
             duplicate_inos += 1;
@@ -405,7 +501,7 @@ fn cmd_fsck(args: FsckArgs) {
             if inode.data_offset < DATA_OFFSET {
                 bad_data_offsets += 1;
                 errors.push(format!(
-                    "inode {} '{name}': data_offset {:#x} is before data region ({:#x})",
+                    "inode {} '{name}': data_offset {:#x} before data region ({:#x})",
                     inode.ino, inode.data_offset, DATA_OFFSET
                 ));
             } else if data_end > disk_size {
@@ -418,7 +514,6 @@ fn cmd_fsck(args: FsckArgs) {
                 used_extents.push((inode.data_offset, inode.size));
             }
         }
-
         if inode.ino < 2 {
             warnings.push(format!("inode {} '{name}': inode number < 2 (reserved)", inode.ino));
         }
@@ -428,9 +523,8 @@ fn cmd_fsck(args: FsckArgs) {
         MAX_FILES, valid_inodes, corrupt_inodes, orphaned_inodes);
 
     println!("  Pass 2: checking free list…");
-
-    let current_free  = dm.free_list.total_free_bytes();
-    let rebuilt       = FreeList::rebuild_from_inodes(&used_extents, disk_size, DATA_OFFSET);
+    let current_free = dm.free_list.total_free_bytes();
+    let rebuilt      = FreeList::rebuild_from_inodes(&used_extents, disk_size, DATA_OFFSET);
     let expected_free = rebuilt.total_free_bytes();
 
     if (current_free as i64 - expected_free as i64).abs() > 4096 {
@@ -449,11 +543,8 @@ fn cmd_fsck(args: FsckArgs) {
     }
 
     println!("  Pass 3: checking superblock…");
-
     if dm.superblock.magic != MAGIC {
-        errors.push(format!(
-            "bad magic: expected {:#x}, got {:#x}", MAGIC, dm.superblock.magic
-        ));
+        errors.push(format!("bad magic: expected {:#x}, got {:#x}", MAGIC, dm.superblock.magic));
     }
     if dm.superblock.block_size != 4096 {
         warnings.push(format!("unusual block size: {}", dm.superblock.block_size));
@@ -471,15 +562,12 @@ fn cmd_fsck(args: FsckArgs) {
             }
         }
     }
-
     println!("    superblock: magic OK, version {}, {} total blocks",
         dm.superblock.version, dm.superblock.total_blocks);
 
     println!("  Pass 4: checking snapshot table…");
-
     let mut valid_snaps   = 0usize;
     let mut corrupt_snaps = 0usize;
-
     for i in 0..256 {
         match dm.read_snapshot(i) {
             Ok(snap) if snap.is_used == 1 => {
@@ -497,7 +585,6 @@ fn cmd_fsck(args: FsckArgs) {
             _ => {}
         }
     }
-
     println!("    {valid_snaps} valid snapshots, {corrupt_snaps} corrupt slots");
 
     println!();
@@ -540,14 +627,14 @@ fn cmd_fsck(args: FsckArgs) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  search                                                                     ║
+// ║  search  (btree call-sites fixed: scans inode table directly)               ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_search(args: SearchArgs) {
     use vexfs::fs::{DiskManager, MAX_FILES};
     use vexfs::ai::search::SearchIndex;
 
-    let query = args.query.join(" ");
+    let query      = args.query.join(" ");
     let mut disk   = DiskManager::open(&args.image)
         .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut search = SearchIndex::new();
@@ -559,6 +646,7 @@ fn cmd_search(args: SearchArgs) {
         let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
         if inode.is_used == 0 { continue; }
         let name = inode.get_name();
+        if name.is_empty() { continue; }
         let data = if inode.size > 0 {
             disk.read_file_data(inode.data_offset, inode.size as usize).unwrap_or_default()
         } else { vec![] };
@@ -571,10 +659,7 @@ fn cmd_search(args: SearchArgs) {
     println!("{}", "─".repeat(50));
 
     let results = search.search(&query);
-    if results.is_empty() {
-        println!("No results found.");
-        return;
-    }
+    if results.is_empty() { println!("No results found."); return; }
     for (i, r) in results.iter().enumerate() {
         println!("{}. {} (score: {:.3})", i + 1, r.name, r.score);
         if !r.matched_terms.is_empty() {
@@ -585,7 +670,7 @@ fn cmd_search(args: SearchArgs) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  status                                                                     ║
+// ║  status  (now shows parent_ino column for hierarchical awareness)           ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_status(args: StatusArgs) {
@@ -597,7 +682,8 @@ fn cmd_status(args: StatusArgs) {
         .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut importance = ImportanceEngine::new();
     let mut search     = SearchIndex::new();
-    let mut files      = vec![];
+    // (ino, name, size, modified_at, parent_ino)
+    let mut files: Vec<(u64, String, u64, u64, u64)> = vec![];
 
     for i in 0..MAX_FILES {
         let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
@@ -612,7 +698,7 @@ fn cmd_status(args: StatusArgs) {
         } else { vec![] };
         search.index(inode.ino, &name, &data, inode.modified_at);
         importance.record_access(inode.ino, &name, 0);
-        files.push((inode.ino, name, inode.size, inode.modified_at));
+        files.push((inode.ino, name, inode.size, inode.modified_at, inode.get_parent_ino()));
     }
 
     println!("\n╔══════════════════════════════════════════════════╗");
@@ -622,14 +708,15 @@ fn cmd_status(args: StatusArgs) {
     println!("📊 Files:        {}", files.len());
     println!("🔍 Indexed:      {}\n", search.indexed_count());
 
-    println!("┌──────┬────────────────────────┬────────┬───────┐");
-    println!("│ Tier │ Name                   │ Size   │ Score │");
-    println!("├──────┼────────────────────────┼────────┼───────┤");
+    println!("┌──────┬─────┬────────────────────────┬────────┬───────┐");
+    println!("│ Tier │ Par │ Name                   │ Size   │ Score │");
+    println!("├──────┼─────┼────────────────────────┼────────┼───────┤");
 
     let ranked = importance.ranked_files();
     if ranked.is_empty() {
-        for (_, name, size, _) in &files {
-            println!("│  --  │ {:<22} │ {:>6} │   --  │", trunc(name, 22), fmt_size(*size));
+        for (_, name, size, _, parent_ino) in &files {
+            println!("│  --  │ {:>3} │ {:<22} │ {:>6} │   --  │",
+                parent_ino, trunc(name, 22), fmt_size(*size));
         }
     } else {
         for f in &ranked {
@@ -638,11 +725,15 @@ fn cmd_status(args: StatusArgs) {
                 vexfs::ai::importance::StorageTier::Warm => "🌤",
                 vexfs::ai::importance::StorageTier::Cold => "🧊",
             };
-            let size = files.iter().find(|(ino, ..)| *ino == f.ino).map(|(_, _, s, _)| *s).unwrap_or(0);
-            println!("│  {icon}  │ {:<22} │ {:>6} │ {:.2}  │", trunc(&f.name, 22), fmt_size(size), f.score);
+            let (size, parent_ino) = files.iter()
+                .find(|(ino, ..)| *ino == f.ino)
+                .map(|(_, _, s, _, p)| (*s, *p))
+                .unwrap_or((0, 1));
+            println!("│  {icon}  │ {:>3} │ {:<22} │ {:>6} │ {:.2}  │",
+                parent_ino, trunc(&f.name, 22), fmt_size(size), f.score);
         }
     }
-    println!("└──────┴────────────────────────┴────────┴───────┘\n");
+    println!("└──────┴─────┴────────────────────────┴────────┴───────┘\n");
 
     if !args.query.is_empty() {
         let q = args.query.join(" ");
@@ -663,7 +754,7 @@ fn cmd_status(args: StatusArgs) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  info                                                                       ║
+// ║  info  (now shows parent directory and diff hint)                           ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_info(args: InfoArgs) {
@@ -688,8 +779,8 @@ fn cmd_info(args: InfoArgs) {
 
     let mut importance = ImportanceEngine::new();
     importance.record_access(inode.ino, &args.filename, 0);
-    let ranked     = importance.ranked_files();
-    let file_info  = ranked.iter().find(|f| f.ino == inode.ino);
+    let ranked    = importance.ranked_files();
+    let file_info = ranked.iter().find(|f| f.ino == inode.ino);
 
     let tier_label = file_info.map(|f| match f.tier {
         vexfs::ai::importance::StorageTier::Hot  => "🔥 HOT",
@@ -712,6 +803,7 @@ fn cmd_info(args: InfoArgs) {
     println!("╚══════════════════════════════════════════════════╝\n");
     println!("  File:      {}", args.filename);
     println!("  Inode:     {}", inode.ino);
+    println!("  Parent:    {} (dir inode)", inode.get_parent_ino());
     println!("  Size:      {}", fmt_size(inode.size));
     println!("  Modified:  {}", age_str(inode.modified_at));
     println!("  Tier:      {tier_label}");
@@ -725,6 +817,7 @@ fn cmd_info(args: InfoArgs) {
         }
         println!();
         println!("  Restore:  vexfs snapshot restore {} {} <version>", args.image, args.filename);
+        println!("  Diff:     vexfs diff {} {} <v1> <v2>", args.image, args.filename);
     }
     println!();
 }
@@ -746,9 +839,7 @@ fn snap_all(image: &str) {
     use vexfs::fs::{DiskManager, MAX_SNAPSHOT_SLOTS};
     const SNAP_MAGIC: u64 = 0x534E415000000001;
 
-    let mut disk = DiskManager::open(image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-
+    let mut disk = DiskManager::open(image).unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut snaps = vec![];
     for i in 0..MAX_SNAPSHOT_SLOTS {
         let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
@@ -780,9 +871,7 @@ fn snap_list(image: &str, filename: &str) {
     use vexfs::fs::{DiskManager, MAX_SNAPSHOT_SLOTS};
     const SNAP_MAGIC: u64 = 0x534E415000000001;
 
-    let mut disk = DiskManager::open(image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-
+    let mut disk = DiskManager::open(image).unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut snaps = vec![];
     for i in 0..MAX_SNAPSHOT_SLOTS {
         let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
@@ -793,10 +882,7 @@ fn snap_list(image: &str, filename: &str) {
 
     println!("\nSnapshots for '{filename}':");
     println!("{}", "─".repeat(50));
-    if snaps.is_empty() {
-        println!("No snapshots found for '{filename}'");
-        return;
-    }
+    if snaps.is_empty() { println!("No snapshots found for '{filename}'"); return; }
     for (id, size, ts) in &snaps {
         println!("  [v{id}] {size} bytes — {}", age_str(*ts));
     }
@@ -808,9 +894,7 @@ fn snap_restore(image: &str, filename: &str, version: u32) {
     use vexfs::fs::{DiskManager, MAX_FILES, MAX_SNAPSHOT_SLOTS};
     const SNAP_MAGIC: u64 = 0x534E415000000001;
 
-    let mut disk = DiskManager::open(image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-
+    let mut disk = DiskManager::open(image).unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut data_offset = 0u64;
     let mut snap_size   = 0u64;
     let mut found = false;
@@ -854,7 +938,6 @@ fn snap_restore(image: &str, filename: &str, version: u32) {
         println!("✓ Restored '{filename}' to v{version} ({} bytes)", data.len());
         return;
     }
-
     die::<()>(&format!("File '{filename}' not found in filesystem."));
 }
 
@@ -862,16 +945,12 @@ fn snap_gc(image: &str, keep: usize) {
     use vexfs::fs::{DiskManager, MAX_SNAPSHOT_SLOTS};
     const SNAP_MAGIC: u64 = 0x534E415000000001;
 
-    let mut disk = DiskManager::open(image)
-        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
-
+    let mut disk = DiskManager::open(image).unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
     let mut by_file: std::collections::HashMap<u64, Vec<usize>> = Default::default();
 
     for i in 0..MAX_SNAPSHOT_SLOTS {
         let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
-        if s.is_valid(SNAP_MAGIC) {
-            by_file.entry(s.ino).or_default().push(i);
-        }
+        if s.is_valid(SNAP_MAGIC) { by_file.entry(s.ino).or_default().push(i); }
     }
 
     let mut removed     = 0usize;
@@ -897,6 +976,567 @@ fn snap_gc(image: &str, keep: usize) {
 
     let _ = disk.flush();
     println!("✓ GC complete — removed {removed} snapshot(s), freed {bytes_freed} bytes.");
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  tree — visual directory tree (VexFS-exclusive)                             ║
+// ║                                                                              ║
+// ║  Reads the on-disk inode table to build a parent→children map, then        ║
+// ║  recursively renders a Unicode box-drawing tree.                            ║
+// ║  inode.get_parent_ino() normalises legacy parent_ino=0 to 1 so old images  ║
+// ║  render correctly alongside new hierarchical ones.                          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_tree(args: TreeArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES};
+    use vexfs::ai::importance::ImportanceEngine;
+    use std::collections::HashMap;
+
+    let mut disk       = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+    let mut importance = ImportanceEngine::new();
+
+    // Build parent → children map.
+    // Entry: (ino, name, size, is_dir, score, tier_icon)
+    let mut children: HashMap<u64, Vec<(u64, String, u64, bool, f32, String)>> = HashMap::new();
+
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        let name = inode.get_name();
+        if name.is_empty() { continue; }
+        importance.record_access(inode.ino, &name, 0);
+        let parent = inode.get_parent_ino();
+        children.entry(parent).or_default().push((
+            inode.ino, name, inode.size, inode.is_dir == 1, 0.0, String::new(),
+        ));
+    }
+
+    // Annotate scores and tiers if requested.
+    if args.tiers {
+        let ranked = importance.ranked_files();
+        for entries in children.values_mut() {
+            for (ino, _, _, _, score, tier) in entries.iter_mut() {
+                if let Some(f) = ranked.iter().find(|f| f.ino == *ino) {
+                    *score = f.score;
+                    *tier  = match f.tier {
+                        vexfs::ai::importance::StorageTier::Hot  => "🔥".to_string(),
+                        vexfs::ai::importance::StorageTier::Warm => "🌤".to_string(),
+                        vexfs::ai::importance::StorageTier::Cold => "🧊".to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Sort: directories first, then alphabetical within each group.
+    for entries in children.values_mut() {
+        entries.sort_by(|a, b| b.3.cmp(&a.3).then(a.1.cmp(&b.1)));
+    }
+
+    println!("\n📁  {} (VexFS)\n", args.image);
+
+    fn print_tree(
+        node: u64,
+        children: &HashMap<u64, Vec<(u64, String, u64, bool, f32, String)>>,
+        prefix: &str,
+        depth: usize,
+        max_depth: usize,
+        show_tiers: bool,
+        show_sizes: bool,
+        total_files: &mut usize,
+        total_dirs:  &mut usize,
+    ) {
+        let entries = match children.get(&node) { Some(e) => e, None => return };
+        for (i, (ino, name, size, is_dir, score, tier)) in entries.iter().enumerate() {
+            let last      = i == entries.len() - 1;
+            let connector = if last { "└── " } else { "├── " };
+            let extension = if last { "    " } else { "│   " };
+
+            let mut line = format!("{prefix}{connector}");
+            if *is_dir {
+                line.push_str(&format!("📁 {name}"));
+                *total_dirs += 1;
+            } else {
+                let icon = if show_tiers && !tier.is_empty() { tier.as_str() } else { "📄" };
+                line.push_str(&format!("{icon} {name}"));
+                *total_files += 1;
+            }
+            if show_sizes && !is_dir {
+                let s = if *size < 1024 { format!(" ({}B)", size) }
+                    else if *size < 1_048_576 { format!(" ({:.1}K)", *size as f64 / 1024.0) }
+                    else { format!(" ({:.1}M)", *size as f64 / 1_048_576.0) };
+                line.push_str(&s);
+            }
+            if show_tiers && *score > 0.0 {
+                line.push_str(&format!(" [{:.2}]", score));
+            }
+            println!("{line}");
+
+            if *is_dir && (max_depth == 0 || depth < max_depth) {
+                print_tree(
+                    *ino, children,
+                    &format!("{prefix}{extension}"),
+                    depth + 1, max_depth, show_tiers, show_sizes,
+                    total_files, total_dirs,
+                );
+            }
+        }
+    }
+
+    let mut total_files = 0usize;
+    let mut total_dirs  = 0usize;
+    print_tree(1, &children, "", 0, args.depth, args.tiers, args.sizes,
+               &mut total_files, &mut total_dirs);
+
+    println!();
+    println!("  {} director{}, {} file{}",
+        total_dirs,  if total_dirs  == 1 { "y" } else { "ies" },
+        total_files, if total_files == 1 { "" }  else { "s" });
+    if args.tiers {
+        println!("  🔥 = HOT  🌤 = WARM  🧊 = COLD  (AI importance tiers)");
+    }
+    println!();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  find — filesystem-wide file finder (VexFS-exclusive)                       ║
+// ║                                                                              ║
+// ║  Reconstructs full paths from parent_ino chains.                           ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_find(args: FindArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES};
+
+    let mut disk = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+
+    struct Entry { name: String, parent: u64, is_dir: bool, size: u64 }
+    let mut entries: std::collections::HashMap<u64, Entry> = Default::default();
+
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        let name = inode.get_name();
+        if name.is_empty() { continue; }
+        entries.insert(inode.ino, Entry {
+            name, parent: inode.get_parent_ino(),
+            is_dir: inode.is_dir == 1, size: inode.size,
+        });
+    }
+
+    // Build full path for an inode by walking the parent chain.
+    let build_path = |mut ino: u64| -> String {
+        let mut parts = vec![];
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            if guard > 64 { break; } // cycle protection
+            match entries.get(&ino) {
+                Some(e) => {
+                    parts.push(e.name.clone());
+                    if e.parent == 1 || e.parent == ino { break; }
+                    ino = e.parent;
+                }
+                None => break,
+            }
+        }
+        parts.reverse();
+        format!("/{}", parts.join("/"))
+    };
+
+    println!("\n🔍  VexFS find — image: {}", args.image);
+    println!("    pattern: \"{}\"  regex: {}\n", args.pattern, args.regex);
+
+    let mut matches = 0usize;
+    let mut sorted_inos: Vec<u64> = entries.keys().copied().collect();
+    sorted_inos.sort();
+
+    for ino in sorted_inos {
+        let entry = &entries[&ino];
+        if args.files_only && entry.is_dir  { continue; }
+        if args.dirs_only  && !entry.is_dir { continue; }
+        if entry.size < args.min_size        { continue; }
+
+        let name_matches = if args.regex {
+            regex_match(&args.pattern, &entry.name)
+        } else {
+            entry.name.to_lowercase().contains(&args.pattern.to_lowercase())
+        };
+        if !name_matches { continue; }
+
+        let path     = build_path(ino);
+        let icon     = if entry.is_dir { "📁" } else { "📄" };
+        let size_str = if entry.is_dir { String::new() }
+                       else { format!("  ({})", fmt_size(entry.size)) };
+        println!("  {icon} {path}{size_str}");
+        matches += 1;
+    }
+
+    println!();
+    if matches == 0 {
+        println!("  No matches found for \"{}\".", args.pattern);
+    } else {
+        println!("  {} match{} found.", matches, if matches == 1 { "" } else { "es" });
+    }
+    println!();
+}
+
+/// Minimal substring / anchor / wildcard matcher (no external deps).
+/// Supports: `^` start-anchor, `$` end-anchor, `.*` wildcard.
+fn regex_match(pattern: &str, text: &str) -> bool {
+    let anchored_start = pattern.starts_with('^');
+    let anchored_end   = pattern.ends_with('$');
+    let core = pattern.trim_start_matches('^').trim_end_matches('$');
+
+    if core.contains(".*") {
+        let parts: Vec<&str> = core.split(".*").collect();
+        let mut remaining = text;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() { continue; }
+            if i == 0 && anchored_start {
+                if !remaining.starts_with(part) { return false; }
+                remaining = &remaining[part.len()..];
+            } else {
+                match remaining.find(part) {
+                    Some(pos) => remaining = &remaining[pos + part.len()..],
+                    None      => return false,
+                }
+            }
+        }
+        if anchored_end && !remaining.is_empty() { return false; }
+        true
+    } else {
+        if anchored_start && anchored_end { text == core }
+        else if anchored_start            { text.starts_with(core) }
+        else if anchored_end              { text.ends_with(core) }
+        else                              { text.contains(core) }
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  heat — AI usage heatmap (VexFS-exclusive)                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_heat(args: HeatArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES};
+    use vexfs::ai::importance::ImportanceEngine;
+
+    let mut disk       = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+    let mut importance = ImportanceEngine::new();
+    let mut file_sizes = std::collections::HashMap::new();
+
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        let name = inode.get_name();
+        if name.is_empty() || inode.is_dir == 1 { continue; }
+        importance.record_access(inode.ino, &name, 0);
+        file_sizes.insert(inode.ino, inode.size);
+    }
+
+    let ranked = importance.ranked_files();
+    let top    = ranked.iter().take(args.top).collect::<Vec<_>>();
+
+    if top.is_empty() {
+        println!("No file data found in {}.", args.image);
+        return;
+    }
+
+    let max_score = top.iter().map(|f| f.score).fold(0.0f32, f32::max).max(0.001);
+    let bar_width = 40usize;
+
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                VexFS AI Importance Heatmap                   ║");
+    println!("╚══════════════════════════════════════════════════════════════╝\n");
+    println!("  Image:  {}    Top {} files\n", args.image, args.top);
+
+    for f in &top {
+        let tier_icon = match f.tier {
+            vexfs::ai::importance::StorageTier::Hot  => "🔥",
+            vexfs::ai::importance::StorageTier::Warm => "🌤",
+            vexfs::ai::importance::StorageTier::Cold => "🧊",
+        };
+        let fill  = ((f.score / max_score) * bar_width as f32) as usize;
+        let empty = bar_width.saturating_sub(fill);
+        let bar_colour = match f.tier {
+            vexfs::ai::importance::StorageTier::Hot  => "\x1b[91m",
+            vexfs::ai::importance::StorageTier::Warm => "\x1b[93m",
+            vexfs::ai::importance::StorageTier::Cold => "\x1b[94m",
+        };
+        let reset    = "\x1b[0m";
+        let size_str = file_sizes.get(&f.ino).copied().map(fmt_size).unwrap_or_default();
+        println!(
+            "  {tier_icon} {:<22}  {bar_colour}{}{reset}{}  {:.3}  {}",
+            trunc(&f.name, 22), "█".repeat(fill), "░".repeat(empty), f.score, size_str,
+        );
+    }
+    println!();
+    println!("  Max score: {:.3}   🔥 HOT  🌤 WARM  🧊 COLD", max_score);
+    println!();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  diff — snapshot diff viewer (VexFS-exclusive)                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_diff(args: DiffArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES, MAX_SNAPSHOT_SLOTS};
+    const SNAP_MAGIC: u64 = 0x534E415000000001;
+
+    let mut disk = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+
+    // Collect all snapshots for this file.
+    let mut snaps: Vec<(u32, u64, u64)> = vec![];
+    for i in 0..MAX_SNAPSHOT_SLOTS {
+        let s = match disk.read_snapshot(i) { Ok(s) => s, Err(_) => break };
+        if !s.is_valid(SNAP_MAGIC) || s.get_name() != args.filename { continue; }
+        snaps.push((s.id, s.data_offset, s.size));
+    }
+    snaps.sort_by_key(|(id, _, _)| *id);
+
+    // Read current file data.
+    let current_data: Vec<u8> = {
+        let mut current = vec![];
+        for i in 0..MAX_FILES {
+            let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+            if !inode.is_valid() || inode.get_name() != args.filename { continue; }
+            if inode.size > 0 {
+                current = disk.read_file_data(inode.data_offset, inode.size as usize)
+                    .unwrap_or_default();
+            }
+            break;
+        }
+        current
+    };
+
+    let mut read_snap = |offset: u64, size: u64| -> Vec<u8> {
+        if size == 0 { return vec![]; }
+        disk.read_file_data(offset, size as usize).unwrap_or_default()
+    };
+
+    let (data_a, label_a, data_b, label_b) = match (args.v1, args.v2) {
+        (None, None) => {
+            if snaps.is_empty() {
+                println!("No snapshots found for '{}'.", args.filename);
+                return;
+            }
+            let (id, off, sz) = snaps.last().unwrap();
+            (read_snap(*off, *sz), format!("v{id} (snapshot)"),
+             current_data, "current".to_string())
+        }
+        (Some(v1), None) => {
+            let snap = snaps.iter().find(|(id, _, _)| *id == v1)
+                .unwrap_or_else(|| die(&format!("Snapshot v{v1} not found")));
+            (read_snap(snap.1, snap.2), format!("v{v1}"),
+             current_data, "current".to_string())
+        }
+        (Some(v1), Some(v2)) => {
+            let sa = snaps.iter().find(|(id, _, _)| *id == v1)
+                .unwrap_or_else(|| die(&format!("Snapshot v{v1} not found")));
+            let sb = snaps.iter().find(|(id, _, _)| *id == v2)
+                .unwrap_or_else(|| die(&format!("Snapshot v{v2} not found")));
+            (read_snap(sa.1, sa.2), format!("v{v1}"),
+             read_snap(sb.1, sb.2), format!("v{v2}"))
+        }
+        _ => { println!("Invalid diff arguments."); return; }
+    };
+
+    let lines_a: Vec<&str> = std::str::from_utf8(&data_a).unwrap_or("").lines().collect();
+    let lines_b: Vec<&str> = std::str::from_utf8(&data_b).unwrap_or("").lines().collect();
+
+    println!("\n╔══════════════════════════════════════════════════╗");
+    println!("║              VexFS Snapshot Diff                 ║");
+    println!("╚══════════════════════════════════════════════════╝\n");
+    println!("  File:  {}", args.filename);
+    println!("  --- {label_a}");
+    println!("  +++ {label_b}\n");
+
+    let (added, removed) = simple_diff(&lines_a, &lines_b);
+
+    println!("\n  {added} addition{}, {removed} removal{}",
+        if added   == 1 { "" } else { "s" },
+        if removed == 1 { "" } else { "s" });
+    println!();
+}
+
+/// Print a simple unified-style diff. Returns (added, removed) counts.
+fn simple_diff(a: &[&str], b: &[&str]) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < a.len() || j < b.len() {
+        match (a.get(i), b.get(j)) {
+            (Some(la), Some(lb)) if la == lb => {
+                println!("   {la}");
+                i += 1; j += 1;
+            }
+            (Some(la), Some(lb)) => {
+                println!("\x1b[91m-  {la}\x1b[0m");
+                println!("\x1b[92m+  {lb}\x1b[0m");
+                removed += 1; added += 1;
+                i += 1; j += 1;
+            }
+            (Some(la), None) => {
+                println!("\x1b[91m-  {la}\x1b[0m");
+                removed += 1;
+                i += 1;
+            }
+            (None, Some(lb)) => {
+                println!("\x1b[92m+  {lb}\x1b[0m");
+                added += 1;
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    (added, removed)
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  tag — AI-powered file tagging (VexFS-exclusive)                            ║
+// ║                                                                              ║
+// ║  Tags are stored in sidecar inodes named ".tags.<filename>" in the root.   ║
+// ║  Usage:                                                                      ║
+// ║    vexfs tag  my.img readme.md "documentation"   # add tag                 ║
+// ║    vexfs tag  my.img readme.md list              # list tags               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_tag(args: TagArgs) {
+    use vexfs::fs::{DiskManager, MAX_FILES, DiskInode};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut disk = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+
+    let sidecar = format!(".tags.{}", args.filename);
+
+    // Find existing sidecar inode.
+    let mut sidecar_slot: Option<usize> = None;
+    let mut sidecar_data = String::new();
+
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        if inode.get_name() != sidecar { continue; }
+        sidecar_slot = Some(i);
+        if inode.size > 0 {
+            let raw = disk.read_file_data(inode.data_offset, inode.size as usize)
+                .unwrap_or_default();
+            sidecar_data = String::from_utf8_lossy(&raw).to_string();
+        }
+        break;
+    }
+
+    if args.tag == "list" {
+        println!("\n🏷  Tags for '{}':", args.filename);
+        if sidecar_data.trim().is_empty() {
+            println!("  (none)");
+        } else {
+            for tag in sidecar_data.lines() {
+                println!("  • {}", tag.trim());
+            }
+        }
+        println!();
+        return;
+    }
+
+    let tag_clean = args.tag.trim().to_lowercase();
+    if sidecar_data.lines().any(|l| l.trim() == tag_clean) {
+        println!("Tag '{}' already exists on '{}'.", tag_clean, args.filename);
+        return;
+    }
+    sidecar_data.push_str(&tag_clean);
+    sidecar_data.push('\n');
+
+    let slot = sidecar_slot.or_else(|| disk.alloc_inode());
+    let slot = match slot {
+        Some(s) => s,
+        None    => { eprintln!("No free inode slots."); return; }
+    };
+
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let data_offset = disk.alloc_data(sidecar_data.len());
+    let _ = disk.write_file_data(data_offset, sidecar_data.as_bytes());
+
+    let mut inode = DiskInode::empty();
+    inode.ino         = 0xDEAD0000 + slot as u64;
+    inode.size        = sidecar_data.len() as u64;
+    inode.data_offset = data_offset;
+    inode.parent_ino  = 1;
+    inode.is_used     = 1;
+    inode.created_at  = ts;
+    inode.modified_at = ts;
+    inode.set_name(&sidecar);
+    let _ = disk.write_inode(slot, &inode);
+    let _ = disk.flush();
+
+    println!("✓ Tagged '{}' with '{}'", args.filename, tag_clean);
+    println!("  Use `vexfs tag {} {} list` to see all tags.", args.image, args.filename);
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  graph — Markov access-pattern graph (VexFS-exclusive)                      ║
+// ║                                                                              ║
+// ║  Reads persisted AI state and renders a text-based directed graph showing  ║
+// ║  which files tend to be opened together / in sequence.                     ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+fn cmd_graph(args: GraphArgs) {
+    use vexfs::ai::persist::AIPersistence;
+
+    let persist = AIPersistence::new(&args.image);
+    let (markov_data, _) = persist.load().unwrap_or_default();
+
+    if markov_data.is_empty() {
+        println!("\nNo Markov data yet for '{}'.", args.image);
+        println!("Mount the filesystem and open some files to build the graph.\n");
+        return;
+    }
+
+    use vexfs::fs::{DiskManager, MAX_FILES};
+    let mut disk = DiskManager::open(&args.image)
+        .unwrap_or_else(|e| die(&format!("Cannot open image: {e}")));
+    let mut ino_to_name: std::collections::HashMap<u64, String> = Default::default();
+    for i in 0..MAX_FILES {
+        let inode = match disk.read_inode(i) { Ok(n) => n, Err(_) => break };
+        if !inode.is_valid() { continue; }
+        let name = inode.get_name();
+        if !name.is_empty() { ino_to_name.insert(inode.ino, name); }
+    }
+
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║           VexFS Markov Access-Pattern Graph              ║");
+    println!("╚══════════════════════════════════════════════════════════╝\n");
+    println!("  Image: {}  (top {} edges per node)\n", args.image, args.max_edges);
+
+    let unknown = "(unknown)".to_string();
+    let mut total_edges = 0usize;
+    let mut sorted_nodes: Vec<&u64> = markov_data.keys().collect();
+    sorted_nodes.sort();
+
+    for from_ino in sorted_nodes {
+        let transitions = &markov_data[from_ino];
+        let from_name = ino_to_name.get(from_ino).unwrap_or(&unknown);
+        let mut sorted_t = transitions.clone();
+        sorted_t.sort_by(|a, b| b.2.cmp(&a.2)); // descending count
+        if sorted_t.is_empty() { continue; }
+
+        println!("  📄 {from_name}");
+        for (to_ino, to_name, count) in sorted_t.iter().take(args.max_edges) {
+            let display = ino_to_name.get(to_ino).unwrap_or(to_name);
+            println!("     ──({count:>3}x)──▶  📄 {display}");
+            total_edges += 1;
+        }
+        println!();
+    }
+
+    println!("  Total graph nodes: {}   edges shown: {}", markov_data.len(), total_edges);
+    println!("  Tip: open files in sequence to strengthen edges.\n");
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1074,13 +1714,12 @@ fn cmd_daemon(args: DaemonArgs) {
         let Ok(size) = stream.read(&mut buffer) else { return; };
         if size == 0 { return; }
 
-        let request  = String::from_utf8_lossy(&buffer[..size]);
+        let request = String::from_utf8_lossy(&buffer[..size]);
         let mut lines = request.lines();
         let req_line = lines.next().unwrap_or("");
         let mut parts = req_line.split_whitespace();
-        let method   = parts.next().unwrap_or("");
-        let path     = parts.next().unwrap_or("/");
-
+        let method = parts.next().unwrap_or("");
+        let path   = parts.next().unwrap_or("/");
         if method != "GET" { return; }
 
         if path == "/api/telemetry" {
@@ -1093,9 +1732,7 @@ fn cmd_daemon(args: DaemonArgs) {
                     );
                     let _ = stream.write_all(resp.as_bytes());
                 }
-                Err(_) => {
-                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n{}");
-                }
+                Err(_) => { let _ = stream.write_all(b"HTTP/1.1 500\r\n\r\n{}"); }
             }
             return;
         }
@@ -1149,16 +1786,7 @@ fn cmd_daemon(args: DaemonArgs) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  gui  —  ONE-CLICK LAUNCHER                                                  ║
-// ║                                                                              ║
-// ║  Lifecycle:                                                                  ║
-// ║    1. Resolve / create mount point (~/.vexfs/mnt by default)                 ║
-// ║    2. Ensure image is formatted (offer mkfs if not)                          ║
-// ║    3. Mount image via FUSE in a background thread                            ║
-// ║    4. Start telemetry daemon in a background thread                          ║
-// ║    5. Wait briefly for FUSE to become ready                                  ║
-// ║    6. Launch egui window                                                     ║
-// ║    7. On GUI exit → unmount + stop daemon                                    ║
+// ║  gui — ONE-CLICK LAUNCHER                                                    ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 fn cmd_gui(args: GuiArgs) {
@@ -1168,87 +1796,66 @@ fn cmd_gui(args: GuiArgs) {
     use std::time::Duration;
     use std::{fs, thread};
 
-    // ── Step 1: resolve mount point ────────────────────────────────────────
+    // ── Step 1: resolve mount point ───────────────────────────────────────
     let mountpoint: PathBuf = match &args.mountpoint {
         Some(m) => PathBuf::from(m),
         None => {
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
+            let home = std::env::var("HOME").map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/tmp"));
             home.join(".vexfs").join("mnt")
         }
     };
 
-    // Try to clean up any stale FUSE mount left over from a previous crash.
-    // fusermount -u is a no-op if nothing is mounted, so this is always safe.
     let _ = std::process::Command::new("fusermount")
         .args(["-u", &mountpoint.to_string_lossy()])
         .output();
 
-    // create_dir_all is idempotent — succeeds even if dir already exists.
     fs::create_dir_all(&mountpoint).unwrap_or_else(|e| {
         die::<()>(&format!("Cannot create mount point '{}': {e}", mountpoint.display()));
     });
     println!("✓ Mount point: {}", mountpoint.display());
 
-    // ── Step 2: check / format image ──────────────────────────────────────
+    // ── Step 2: check / format image ─────────────────────────────────────
     let image_path = PathBuf::from(&args.image);
-
     if !image_path.exists() {
-        println!("Image '{}' not found.", image_path.display());
-        println!("Creating a new 128 MB VexFS image…");
-
+        println!("Image '{}' not found. Creating a new 128 MB VexFS image…", image_path.display());
         use std::fs::File;
         let file = File::create(&image_path)
             .unwrap_or_else(|e| die(&format!("Cannot create image: {e}")));
         file.set_len(128 * 1024 * 1024)
             .unwrap_or_else(|e| die(&format!("Cannot set image size: {e}")));
-
         use vexfs::fs::DiskManager;
         let mut disk = DiskManager::format(&args.image, 128 * 1024 * 1024)
             .unwrap_or_else(|e| die(&format!("Format failed: {e}")));
-        disk.flush()
-            .unwrap_or_else(|e| die(&format!("Flush failed: {e}")));
-
+        disk.flush().unwrap_or_else(|e| die(&format!("Flush failed: {e}")));
         println!("✓ Created and formatted: {}", image_path.display());
     } else {
         println!("✓ Image: {}", image_path.display());
     }
 
-    // ── Step 3: mount in background thread ────────────────────────────────
+    // ── Step 3: mount in background thread ───────────────────────────────
     let mounted = Arc::new(AtomicBool::new(false));
 
     if !args.no_mount {
-        // Check if already mounted by probing the magic telemetry file
         let tel_probe = mountpoint.join(".vexfs-telemetry.json");
-        let already_mounted = tel_probe.exists();
-
-        if already_mounted {
+        if tel_probe.exists() {
             println!("✓ Already mounted at {}", mountpoint.display());
             mounted.store(true, Ordering::Relaxed);
         } else {
             let image_for_mount = args.image.clone();
             let mnt_for_mount   = mountpoint.clone();
             let mounted_flag    = Arc::clone(&mounted);
-
             println!("  Mounting {} → {}…", image_for_mount, mnt_for_mount.display());
-
             thread::spawn(move || {
                 use fuser::MountOption;
                 use vexfs::fuse::VexFS;
                 use vexfs::fs::DiskManager;
-
                 let disk = match DiskManager::open(&image_for_mount) {
                     Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("Mount thread: cannot open image: {e}");
-                        return;
-                    }
+                    Err(e) => { eprintln!("Mount thread: {e}"); return; }
                 };
-
                 let fs = VexFS::load(disk, &image_for_mount);
                 mounted_flag.store(true, Ordering::Relaxed);
-
                 if let Err(e) = fuser::mount2(fs, &mnt_for_mount, &[
                     MountOption::RW,
                     MountOption::FSName("vexfs".to_string()),
@@ -1258,11 +1865,9 @@ fn cmd_gui(args: GuiArgs) {
                 }
             });
 
-            // Wait up to 3 seconds for mount to become ready
             for attempt in 0..30 {
                 thread::sleep(Duration::from_millis(100));
                 if mounted.load(Ordering::Relaxed) {
-                    // Give FUSE a moment to register the root directory
                     thread::sleep(Duration::from_millis(200));
                     break;
                 }
@@ -1270,7 +1875,6 @@ fn cmd_gui(args: GuiArgs) {
                     eprintln!("warning: mount did not confirm within 3s — proceeding anyway");
                 }
             }
-
             println!("✓ Mounted at {}", mountpoint.display());
         }
     } else {
@@ -1278,110 +1882,82 @@ fn cmd_gui(args: GuiArgs) {
         mounted.store(true, Ordering::Relaxed);
     }
 
-    // ── Step 4: start telemetry daemon in background ───────────────────────
-    let daemon_url = format!("http://localhost:{}", args.port);
-    let port_str   = args.port.clone();
+    // ── Step 4: start telemetry daemon ───────────────────────────────────
+    let daemon_url    = format!("http://localhost:{}", args.port);
+    let port_str      = args.port.clone();
     let mnt_for_daemon = mountpoint.clone();
 
-    // Try to bind the port; if it fails, the daemon may already be running
     {
         use std::net::TcpListener;
         match TcpListener::bind(format!("0.0.0.0:{port_str}")) {
             Ok(listener) => {
-                // Bind succeeded — spawn the daemon
-                drop(listener); // release the port so the daemon thread can bind
+                drop(listener);
                 let dashboard_dir = std::env::current_dir()
                     .unwrap_or_else(|_| PathBuf::from("."))
                     .join("dashboard");
-
                 thread::spawn(move || {
                     run_daemon_thread(mnt_for_daemon, port_str, dashboard_dir);
                 });
-
                 println!("✓ Telemetry daemon started on {daemon_url}");
             }
-            Err(_) => {
-                println!("✓ Daemon already running on {daemon_url}");
-            }
+            Err(_) => println!("✓ Daemon already running on {daemon_url}"),
         }
     }
 
-    // ── Step 5: brief settle delay ─────────────────────────────────────────
     thread::sleep(Duration::from_millis(300));
 
-    // ── Step 6: headless check — display available? ───────────────────────
+    // ── Step 5: headless or GUI ───────────────────────────────────────────
     let has_display = !std::env::var("DISPLAY").unwrap_or_default().is_empty()
         || !std::env::var("WAYLAND_DISPLAY").unwrap_or_default().is_empty();
-
     let run_headless = args.headless || !has_display;
 
     if run_headless {
-        // ── Headless mode: web dashboard only ─────────────────────────────
         println!("  ╔══════════════════════════════════════════════════╗");
         println!("  ║   VexFS Explorer  →  http://localhost:{}       ║", args.port);
         println!("  ║   Open this URL in your Windows browser          ║");
         println!("  ║   Press Ctrl-C to unmount and stop               ║");
         println!("  ╚══════════════════════════════════════════════════╝\n");
-
-        // Block forever (daemon thread runs in background)
-        // Handle Ctrl-C for graceful unmount
         let mnt_str  = mountpoint.to_string_lossy().to_string();
         let no_mount = args.no_mount;
         let was_mounted = mounted.clone();
         ctrlc_or_park(move || {
             if !no_mount && was_mounted.load(Ordering::Relaxed) {
-                println!("\n  Unmounting {}…", mnt_str);
+                println!("\n  Unmounting {mnt_str}…");
                 let _ = std::process::Command::new("fusermount")
-                    .args(["-u", &mnt_str])
-                    .status();
+                    .args(["-u", &mnt_str]).status();
                 println!("  Goodbye.");
             }
         });
     } else {
-        // ── GUI mode: try to open the native window ───────────────────────
-        // On WSL2, force X11 (clear stale WAYLAND_DISPLAY if set)
         if std::env::var("WSL_DISTRO_NAME").is_ok() {
             unsafe { std::env::remove_var("WAYLAND_DISPLAY"); }
             std::env::set_var("WINIT_UNIX_BACKEND", "x11");
         }
-
         println!("\n  Launching VexFS Explorer…");
         println!("  (Also available at http://localhost:{})\n", args.port);
-
         let image_path_str = args.image.clone();
         gui_app::run(mountpoint.clone(), Some(image_path_str), daemon_url);
 
-        // ── Step 7: teardown on GUI exit ──────────────────────────────────
         if !args.no_mount && mounted.load(Ordering::Relaxed) {
             println!("\n  Unmounting {}…", mountpoint.display());
             let mnt_str = mountpoint.to_string_lossy().to_string();
             let _ = std::process::Command::new("fusermount")
-                .args(["-u", &mnt_str])
-                .status();
+                .args(["-u", &mnt_str]).status();
             println!("  Goodbye.");
         }
     }
 }
 
-/// Block the calling thread until SIGINT (Ctrl-C), then run the cleanup closure.
 fn ctrlc_or_park<F: FnOnce() + Send + 'static>(on_exit: F) {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel::<()>();
-    // Register a Ctrl-C handler that sends a signal
     std::thread::spawn(move || {
-        // Simple signal: park the thread and wake on SIGINT via a loop check
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            // The daemon thread runs indefinitely; this thread just keeps the
-            // process alive. When the user presses Ctrl-C the OS terminates us,
-            // but we give them a clean SIGINT path via channel.
             if tx.send(()).is_err() { break; }
         }
     });
-    // Block until channel closes (process killed) or recv fails
-    loop {
-        if rx.recv().is_err() { break; }
-    }
+    loop { if rx.recv().is_err() { break; } }
     on_exit();
 }
 
@@ -1402,8 +1978,12 @@ fn call_llm(query: &str, telemetry: &str, mountpoint: &std::path::PathBuf) -> St
             if let Ok(name) = entry.file_name().into_string() {
                 if !name.starts_with(".vexfs") && query.contains(&name) {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        let snippet = if content.len() > 4000 { format!("{}... (truncated)", &content[..4000]) } else { content };
-                        extra_context.push_str(&format!("\n\n--- Contents of {} ---\n{}\n", name, snippet));
+                        let snippet = if content.len() > 4000 {
+                            format!("{}... (truncated)", &content[..4000])
+                        } else { content };
+                        extra_context.push_str(&format!(
+                            "\n\n--- Contents of {} ---\n{}\n", name, snippet
+                        ));
                     }
                 }
             }
@@ -1449,37 +2029,30 @@ fn call_llm(query: &str, telemetry: &str, mountpoint: &std::path::PathBuf) -> St
         Err(e) => return format!("Network error: {}", e),
     };
 
-    // Read as raw text first — avoids failing on charset/encoding edge cases
     let raw = match resp.text() {
         Ok(t)  => t,
         Err(e) => return format!("Failed to read response: {}", e),
     };
 
-    // Parse JSON — handle both object {} and Google's array-wrapped [{}] formats
     let json: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
+        Ok(v)  => v,
         Err(_) => return format!("Non-JSON response (first 200 chars): {}", &raw[..raw.len().min(200)]),
     };
 
-    // Unwrap array wrapper if present (Google sometimes returns [{...}])
     let obj = match json.as_array() {
         Some(arr) => arr.first().cloned().unwrap_or_else(|| json.clone()),
         None => json.clone(),
     };
 
-    // Standard OpenAI choices path
     if let Some(content) = obj["choices"][0]["message"]["content"].as_str() {
         return content.to_string();
     }
-    // Error message path
     if let Some(err) = obj["error"]["message"].as_str() {
         return format!("API Error: {}", err);
     }
-
     format!("Unexpected response: {}", &raw[..raw.len().min(300)])
 }
 
-/// Inner daemon loop — runs in a background thread spawned by cmd_gui.
 fn run_daemon_thread(
     mountpoint: std::path::PathBuf,
     port: String,
@@ -1498,30 +2071,33 @@ fn run_daemon_thread(
                  Access-Control-Allow-Headers: Content-Type\r\n\
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
-            )
-            .as_bytes(),
+            ).as_bytes(),
         );
     }
-
-    fn json_ok(stream: &mut TcpStream, body: &str) {
-        cors(stream, "200 OK", "application/json", body);
-    }
-
-    fn json_err(stream: &mut TcpStream, msg: &str) {
-        cors(stream, "400 Bad Request", "application/json",
-             &format!("{{\"error\":\"{msg}\"}}"));
-    }
+    fn json_ok(s: &mut TcpStream, b: &str)  { cors(s, "200 OK", "application/json", b); }
+    fn json_err(s: &mut TcpStream, m: &str) { cors(s, "400 Bad Request", "application/json",
+                                                    &format!("{{\"error\":\"{m}\"}}")) ; }
 
     fn escape_json(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+         .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
+    }
+
+    fn urldecode(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let h1 = chars.next().unwrap_or('0');
+                let h2 = chars.next().unwrap_or('0');
+                let hex = format!("{h1}{h2}");
+                if let Ok(b) = u8::from_str_radix(&hex, 16) { out.push(b as char); }
+            } else { out.push(c); }
+        }
+        out
     }
 
     fn handle(mut stream: TcpStream, mountpoint: std::path::PathBuf, dashboard_dir: std::path::PathBuf) {
-        // Read the full request (headers + body up to 256 KB)
         let mut buf = vec![0u8; 262144];
         let n = match stream.read(&mut buf) { Ok(n) => n, Err(_) => return };
         if n == 0 { return; }
@@ -1532,13 +2108,10 @@ fn run_daemon_thread(
         let method = parts.next().unwrap_or("").to_uppercase();
         let path   = parts.next().unwrap_or("/").to_string();
 
-        // Parse Content-Length
         let content_length: usize = raw.lines()
             .find(|l| l.to_lowercase().starts_with("content-length:"))
             .and_then(|l| l.splitn(2, ':').nth(1)?.trim().parse().ok())
             .unwrap_or(0);
-
-        // Extract body (after \r\n\r\n)
         let body_str = raw.find("\r\n\r\n")
             .map(|i| &raw[i + 4..])
             .unwrap_or("")
@@ -1546,13 +2119,8 @@ fn run_daemon_thread(
             .unwrap_or("")
             .to_string();
 
-        // CORS preflight
-        if method == "OPTIONS" {
-            cors(&mut stream, "204 No Content", "text/plain", "");
-            return;
-        }
+        if method == "OPTIONS" { cors(&mut stream, "204 No Content", "text/plain", ""); return; }
 
-        // ── /api/telemetry ────────────────────────────────────────────────
         if path == "/api/telemetry" {
             let body = fs::read_to_string(mountpoint.join(".vexfs-telemetry.json"))
                 .unwrap_or_else(|_| "{}".into());
@@ -1560,7 +2128,6 @@ fn run_daemon_thread(
             return;
         }
 
-        // ── /api/files  — list directory ──────────────────────────────────
         if path == "/api/files" && method == "GET" {
             let mut items = String::from("[");
             let mut first_item = true;
@@ -1568,10 +2135,10 @@ fn run_daemon_thread(
                 for entry in rd.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.starts_with(".vexfs-") { continue; }
-                    let meta  = entry.metadata().ok();
-                    let size  = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let meta   = entry.metadata().ok();
+                    let size   = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                    let ext   = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                    let ext    = name.rsplit('.').next().unwrap_or("").to_lowercase();
                     let is_text = matches!(ext.as_str(),
                         "txt"|"md"|"rs"|"toml"|"yaml"|"yml"|"json"|"sh"|"py"|
                         "js"|"ts"|"html"|"css"|"c"|"h"|"cpp"|"go"|"java"|
@@ -1589,20 +2156,15 @@ fn run_daemon_thread(
             return;
         }
 
-        // ── /api/file/<name>  — read file ─────────────────────────────────
         if let Some(name) = path.strip_prefix("/api/file/") {
             let fname = urldecode(name);
             let fpath = mountpoint.join(&fname);
-
             match method.as_str() {
                 "GET" => {
                     match fs::read_to_string(&fpath) {
-                        Ok(content) => {
-                            let escaped = escape_json(&content);
-                            json_ok(&mut stream,
-                                &format!("{{\"name\":\"{}\",\"content\":\"{}\"}}",
-                                    escape_json(&fname), escaped));
-                        }
+                        Ok(content) => json_ok(&mut stream,
+                            &format!("{{\"name\":\"{}\",\"content\":\"{}\"}}",
+                                escape_json(&fname), escape_json(&content))),
                         Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
                     }
                 }
@@ -1614,7 +2176,13 @@ fn run_daemon_thread(
                     }
                 }
                 "DELETE" => {
-                    match fs::remove_file(&fpath) {
+                    let meta = fs::metadata(&fpath);
+                    let res = if let Ok(m) = meta {
+                        if m.is_dir() { fs::remove_dir_all(&fpath) } else { fs::remove_file(&fpath) }
+                    } else {
+                        fs::remove_file(&fpath)
+                    };
+                    match res {
                         Ok(_)  => json_ok(&mut stream,
                             &format!("{{\"ok\":true,\"name\":\"{}\"}}", escape_json(&fname))),
                         Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
@@ -1625,41 +2193,50 @@ fn run_daemon_thread(
             return;
         }
 
-        // ── /api/search  — TF-IDF search ─────────────────────────────────
+        if let Some(name) = path.strip_prefix("/api/dir/") {
+            let dname = urldecode(name);
+            let dpath = mountpoint.join(&dname);
+            match method.as_str() {
+                "POST" => {
+                    match fs::create_dir(&dpath) {
+                        Ok(_)  => json_ok(&mut stream,
+                            &format!("{{\"ok\":true,\"name\":\"{}\"}}", escape_json(&dname))),
+                        Err(e) => json_err(&mut stream, &escape_json(&e.to_string())),
+                    }
+                }
+                _ => json_err(&mut stream, "method not allowed"),
+            }
+            return;
+        }
+
+
         if path == "/api/search" && method == "POST" {
             let search_path = mountpoint.join(".vexfs-search");
             let result = (|| -> Option<String> {
                 fs::write(&search_path, body_str.trim().as_bytes()).ok()?;
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                let out = fs::read_to_string(&search_path).ok()?;
-                Some(out)
+                fs::read_to_string(&search_path).ok()
             })().unwrap_or_default();
             json_ok(&mut stream,
                 &format!("{{\"result\":\"{}\"}}", escape_json(result.trim())));
             return;
         }
 
-// ── /api/ask  — AI question (Real LLM integration) ────────────────────────
         if path == "/api/ask" && method == "POST" {
             let q = body_str.trim().to_string();
             let tel_path = mountpoint.join(".vexfs-telemetry.json");
             let tel_data = fs::read_to_string(&tel_path).unwrap_or_else(|_| "{}".to_string());
-            
-            // Block and wait for OpenRouter response
-            let answer = call_llm(&q, &tel_data, &mountpoint);
+            let answer   = call_llm(&q, &tel_data, &mountpoint);
             json_ok(&mut stream,
                 &format!("{{\"result\":\"{}\"}}", escape_json(&answer)));
             return;
         }
 
-        // ── /api/snapshots  — list via CLI ────────────────────────────────
         if path == "/api/snapshots" && method == "GET" {
-            // Read from the telemetry file's snapshot count for now
             json_ok(&mut stream, "[]");
             return;
         }
 
-        // ── Static files from dashboard/ ──────────────────────────────────
         let file_path = if path == "/" {
             dashboard_dir.join("index.html")
         } else {
@@ -1684,24 +2261,6 @@ fn run_daemon_thread(
         }
     }
 
-    fn urldecode(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                let h1 = chars.next().unwrap_or('0');
-                let h2 = chars.next().unwrap_or('0');
-                let hex = format!("{h1}{h2}");
-                if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                    out.push(b as char);
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
     let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{port}")) else { return; };
     for stream in listener.incoming().flatten() {
         let mnt  = mountpoint.clone();
@@ -1722,9 +2281,7 @@ fn die<T>(msg: &str) -> T {
 fn age_str(timestamp: u64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let age = now.saturating_sub(timestamp);
     if age < 60         { format!("{age}s ago") }
     else if age < 3600  { format!("{}m ago", age / 60) }

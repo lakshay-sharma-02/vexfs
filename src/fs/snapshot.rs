@@ -121,8 +121,8 @@ impl SnapshotManager {
     /// GC: keep only the `keep` most recent snapshots per file.
     /// Returns a list of disk_slot values that should be zeroed on disk.
     /// Only returns slots that were actually written (disk_slot != usize::MAX).
-    pub fn gc_keep_per_file(&mut self, keep: usize) -> Vec<usize> {
-        let mut freed_slots = Vec::new();
+    pub fn gc_keep_per_file(&mut self, keep: usize) -> Vec<(usize, u64, u64)> {
+        let mut freed = Vec::new();
         for snaps in self.snapshots.values_mut() {
             if snaps.len() <= keep {
                 continue;
@@ -133,11 +133,11 @@ impl SnapshotManager {
             let removed: Vec<Snapshot> = snaps.drain(..to_remove).collect();
             for s in removed {
                 if s.disk_slot != usize::MAX {
-                    freed_slots.push(s.disk_slot);
+                    freed.push((s.disk_slot, s.data_offset, s.size));
                 }
             }
         }
-        freed_slots
+        freed
     }
 }
 

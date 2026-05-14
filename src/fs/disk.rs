@@ -148,31 +148,24 @@ impl SuperblockRaw {
 
 /// Safe on-disk inode serialisation — no unsafe.
 ///
-/// Layout (256 bytes):
-///   0..8    ino           u64 LE
-///   8..16   size          u64 LE
-///  16..24   data_offset   u64 LE
-///  24..32   created_at    u64 LE
-///  32..40   modified_at   u64 LE
-///  40       is_used       u8
-///  41       is_dir        u8
-///  42..46   _pad          [u8;4]
-///  46..50   crc32         u32 LE  (covers bytes 0..46)
-///  50..258  name          [u8;206]   -- fits in 256 total
-///
-/// Wait — let's keep it exactly 256:
-///   0..8    ino           u64 LE      8
+/// Layout (256 bytes total):
+///   0.. 8   ino           u64 LE      8
 ///   8..16   size          u64 LE      8
 ///  16..24   data_offset   u64 LE      8
 ///  24..32   created_at    u64 LE      8
 ///  32..40   modified_at   u64 LE      8
-///  40       is_used       u8          1
-///  41       is_dir        u8          1
-///  42..46   crc32         u32 LE      4  (covers bytes 0..42)
-///  46..48   _pad          [u8;2]      2
-///  48..256  name          [u8;208]  208
-///                                  ---
-///                                  256
+///  40..48   parent_ino    u64 LE      8   ← NEW (0 = root/legacy)
+///  48       is_used       u8          1
+///  49       is_dir        u8          1
+///  50..54   crc32         u32 LE      4   (covers bytes 0..50)
+///  54..56   _pad          [u8; 2]     2
+///  56..256  name          [u8; 200]  200
+///                                   ----
+///                                    256
+///
+/// Backwards compat: old images written without parent_ino will have 0 in
+/// bytes 40..48.  `get_parent_ino()` returns 1 (root) when the stored value
+/// is 0, so old files still appear in the root directory listing.
 pub const INODE_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -182,9 +175,13 @@ pub struct InodeRaw {
     pub data_offset: u64,
     pub created_at:  u64,
     pub modified_at: u64,
+    /// Parent directory inode number.  0 means "not set" (legacy); callers
+    /// should use `get_parent_ino()` which normalises 0 → 1.
+    pub parent_ino:  u64,
     pub is_used:     u8,
     pub is_dir:      u8,
-    pub name:        [u8; 208],
+    /// Up to 199 UTF-8 bytes + NUL terminator.
+    pub name:        [u8; 200],
 }
 
 impl InodeRaw {
@@ -192,8 +189,9 @@ impl InodeRaw {
         Self {
             ino: 0, size: 0, data_offset: 0,
             created_at: 0, modified_at: 0,
+            parent_ino: 0,
             is_used: 0, is_dir: 0,
-            name: [0u8; 208],
+            name: [0u8; 200],
         }
     }
 
@@ -204,22 +202,23 @@ impl InodeRaw {
         b[16..24].copy_from_slice(&u64_to_le(self.data_offset));
         b[24..32].copy_from_slice(&u64_to_le(self.created_at));
         b[32..40].copy_from_slice(&u64_to_le(self.modified_at));
-        b[40] = self.is_used;
-        b[41] = self.is_dir;
-        // crc32 over bytes 0..42
-        let checksum = crc32(&b[..42]);
-        b[42..46].copy_from_slice(&u32_to_le(checksum));
-        // pad bytes 46..48 = 0
-        b[48..256].copy_from_slice(&self.name);
+        b[40..48].copy_from_slice(&u64_to_le(self.parent_ino));
+        b[48] = self.is_used;
+        b[49] = self.is_dir;
+        // crc32 covers bytes 0..50 (everything before the checksum field)
+        let checksum = crc32(&b[..50]);
+        b[50..54].copy_from_slice(&u32_to_le(checksum));
+        // bytes 54..56 = pad (already zeroed)
+        b[56..256].copy_from_slice(&self.name);
         b
     }
 
     pub fn from_bytes(b: &[u8; INODE_BYTES]) -> DiskResult<Self> {
-        let stored = le_to_u32(b[42..46].try_into().unwrap());
-        verify_crc32(&b[..42], stored)?;
+        let stored = le_to_u32(b[50..54].try_into().unwrap());
+        verify_crc32(&b[..50], stored)?;
 
-        let mut name = [0u8; 208];
-        name.copy_from_slice(&b[48..256]);
+        let mut name = [0u8; 200];
+        name.copy_from_slice(&b[56..256]);
 
         Ok(Self {
             ino:         le_to_u64(b[0..8].try_into().unwrap()),
@@ -227,8 +226,9 @@ impl InodeRaw {
             data_offset: le_to_u64(b[16..24].try_into().unwrap()),
             created_at:  le_to_u64(b[24..32].try_into().unwrap()),
             modified_at: le_to_u64(b[32..40].try_into().unwrap()),
-            is_used:     b[40],
-            is_dir:      b[41],
+            parent_ino:  le_to_u64(b[40..48].try_into().unwrap()),
+            is_used:     b[48],
+            is_dir:      b[49],
             name,
         })
     }
@@ -241,8 +241,14 @@ impl InodeRaw {
         true
     }
 
+    /// Returns the effective parent inode number.
+    /// Normalises the legacy value `0` to `1` (root) for backwards compat.
+    pub fn get_parent_ino(&self) -> u64 {
+        if self.parent_ino == 0 { 1 } else { self.parent_ino }
+    }
+
     pub fn get_name(&self) -> String {
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(208);
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(200);
         let s = String::from_utf8_lossy(&self.name[..end]).to_string();
         if s.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || "._- ".contains(c))) {
             s
@@ -252,9 +258,9 @@ impl InodeRaw {
     }
 
     pub fn set_name(&mut self, name: &str) {
-        self.name = [0u8; 208];
+        self.name = [0u8; 200];
         let bytes = name.as_bytes();
-        let len = bytes.len().min(207);
+        let len = bytes.len().min(199);
         self.name[..len].copy_from_slice(&bytes[..len]);
     }
 }
@@ -324,7 +330,7 @@ impl SnapshotRaw {
             timestamp:   le_to_u64(b[32..40].try_into().unwrap()),
             id:          le_to_u32(b[40..44].try_into().unwrap()),
             is_used:     b[44],
-        name,
+            name,
         })
     }
 
@@ -353,6 +359,8 @@ impl SnapshotRaw {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Superblock ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_superblock_roundtrip() {
@@ -392,13 +400,16 @@ mod tests {
         assert!(SuperblockRaw::from_bytes(&bytes).is_err());
     }
 
+    // ── Inode ─────────────────────────────────────────────────────────────────
+
     #[test]
     fn test_inode_roundtrip() {
         let mut inode = InodeRaw::empty();
-        inode.ino = 42;
-        inode.size = 1024;
+        inode.ino        = 42;
+        inode.size       = 1024;
         inode.data_offset = 65536;
-        inode.is_used = 1;
+        inode.parent_ino = 1;
+        inode.is_used    = 1;
         inode.set_name("hello_world.rs");
 
         let bytes = inode.to_bytes();
@@ -406,13 +417,15 @@ mod tests {
         let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
         assert_eq!(inode2.ino, 42);
         assert_eq!(inode2.size, 1024);
+        assert_eq!(inode2.parent_ino, 1);
+        assert_eq!(inode2.get_parent_ino(), 1);
         assert_eq!(inode2.get_name(), "hello_world.rs");
     }
 
     #[test]
     fn test_inode_bad_checksum() {
         let mut inode = InodeRaw::empty();
-        inode.ino = 1;
+        inode.ino    = 1;
         inode.is_used = 1;
         inode.set_name("file.txt");
         let mut bytes = inode.to_bytes();
@@ -420,13 +433,83 @@ mod tests {
         assert!(InodeRaw::from_bytes(&bytes).is_err());
     }
 
+    /// Legacy inode with parent_ino == 0 should normalise to 1 (root).
+    #[test]
+    fn test_inode_parent_ino_legacy_zero() {
+        let mut inode = InodeRaw::empty();
+        inode.ino       = 5;
+        inode.parent_ino = 0; // simulate old on-disk image
+        inode.is_used   = 1;
+        inode.set_name("legacy.txt");
+        let bytes = inode.to_bytes();
+        let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
+        // Raw field preserved as 0 on disk.
+        assert_eq!(inode2.parent_ino, 0);
+        // But the accessor normalises to 1 (root).
+        assert_eq!(inode2.get_parent_ino(), 1);
+    }
+
+    /// A file inside a subdirectory.
+    #[test]
+    fn test_inode_nested_parent() {
+        let mut inode = InodeRaw::empty();
+        inode.ino       = 100;
+        inode.parent_ino = 42; // lives inside directory inode 42
+        inode.is_used   = 1;
+        inode.set_name("nested.rs");
+        let bytes = inode.to_bytes();
+        let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
+        assert_eq!(inode2.parent_ino, 42);
+        assert_eq!(inode2.get_parent_ino(), 42);
+        assert_eq!(inode2.get_name(), "nested.rs");
+    }
+
+    #[test]
+    fn test_inode_name_max_length() {
+        let mut inode = InodeRaw::empty();
+        inode.is_used   = 1;
+        inode.parent_ino = 1;
+        let long_name = "a".repeat(300);
+        inode.set_name(&long_name);
+        let bytes = inode.to_bytes();
+        let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
+        // set_name caps at 199 bytes (+ NUL = 200).
+        assert!(inode2.get_name().len() <= 199);
+    }
+
+    #[test]
+    fn test_inode_bytes_size() {
+        // Compile-time constant and actual serialised size must agree.
+        let inode = InodeRaw::empty();
+        assert_eq!(inode.to_bytes().len(), INODE_BYTES);
+        assert_eq!(INODE_BYTES, 256);
+    }
+
+    /// parent_ino field survives a round-trip for several distinct values.
+    #[test]
+    fn test_inode_parent_ino_roundtrip_multiple() {
+        for &pid in &[1u64, 2, 5, 42, u64::MAX / 2] {
+            let mut inode = InodeRaw::empty();
+            inode.ino       = pid * 3;
+            inode.parent_ino = pid;
+            inode.is_used   = 1;
+            inode.set_name("test.txt");
+            let bytes = inode.to_bytes();
+            let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
+            assert_eq!(inode2.parent_ino, pid,
+                "parent_ino round-trip failed for pid={pid}");
+        }
+    }
+
+    // ── Snapshot ──────────────────────────────────────────────────────────────
+
     #[test]
     fn test_snapshot_roundtrip() {
         let mut snap = SnapshotRaw::empty();
-        snap.magic = 0x534E415000000001;
-        snap.ino = 5;
-        snap.size = 2048;
-        snap.id = 7;
+        snap.magic   = 0x534E415000000001;
+        snap.ino     = 5;
+        snap.size    = 2048;
+        snap.id      = 7;
         snap.is_used = 1;
         snap.set_name("config.toml");
 
@@ -436,16 +519,5 @@ mod tests {
         assert_eq!(snap2.ino, 5);
         assert_eq!(snap2.id, 7);
         assert_eq!(snap2.get_name(), "config.toml");
-    }
-
-    #[test]
-    fn test_inode_name_max_length() {
-        let mut inode = InodeRaw::empty();
-        inode.is_used = 1;
-        let long_name = "a".repeat(300);
-        inode.set_name(&long_name);
-        let bytes = inode.to_bytes();
-        let inode2 = InodeRaw::from_bytes(&bytes).unwrap();
-        assert!(inode2.get_name().len() <= 207);
     }
 }

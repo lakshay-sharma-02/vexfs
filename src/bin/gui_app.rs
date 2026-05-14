@@ -239,6 +239,7 @@ struct VexApp {
     // ── New-file dialog
     new_file_name:    String,
     new_file_content: String,
+    new_is_dir:       bool,
     show_new_dialog:  bool,
     new_file_status:  String,
 
@@ -283,6 +284,7 @@ impl VexApp {
             files_view: FilesView::List,
             new_file_name:    String::new(),
             new_file_content: String::new(),
+            new_is_dir:       false,
             show_new_dialog:  false,
             new_file_status:  String::new(),
             delete_confirm:   None,
@@ -396,18 +398,25 @@ impl VexApp {
     fn create_new_file(&mut self) {
         let name = self.new_file_name.trim().to_string();
         if name.is_empty() {
-            self.new_file_status = "File name cannot be empty.".into();
+            self.new_file_status = "Name cannot be empty.".into();
             return;
         }
         let path = self.mountpoint.join(&name);
-        match fs::write(&path, self.new_file_content.as_bytes()) {
+        let res = if self.new_is_dir {
+            fs::create_dir(&path)
+        } else {
+            fs::write(&path, self.new_file_content.as_bytes())
+        };
+
+        match res {
             Ok(_) => {
+                let kind = if self.new_is_dir { "Directory" } else { "File" };
                 self.new_file_status = format!("Created  ✓  {name}");
                 self.show_new_dialog  = false;
                 self.new_file_name    = String::new();
                 self.new_file_content = String::new();
                 self.last_file_scan  -= Duration::from_secs(10);
-                self.status = format!("Created  ·  {name}");
+                self.status = format!("Created {kind}  ·  {name}");
             }
             Err(e) => {
                 self.new_file_status = format!("Error: {e}");
@@ -417,7 +426,13 @@ impl VexApp {
 
     fn delete_file(&mut self, filename: &str) {
         let path = self.mountpoint.join(filename);
-        match fs::remove_file(&path) {
+        let meta = fs::metadata(&path);
+        let res = if let Ok(m) = meta {
+            if m.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }
+        } else {
+            fs::remove_file(&path)
+        };
+        match res {
             Ok(_) => {
                 self.status = format!("Deleted  ·  {filename}");
                 self.last_file_scan -= Duration::from_secs(10);
@@ -607,7 +622,7 @@ impl VexApp {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
-                if accent_button(ui, "+ New File", 90.0, false).clicked() {
+                if accent_button(ui, "+ New Item", 90.0, false).clicked() {
                     self.show_new_dialog = true;
                     self.new_file_status = String::new();
                 }
@@ -619,22 +634,29 @@ impl VexApp {
         // ── New-file dialog ───────────────────────────────────────────────
         if self.show_new_dialog {
             glass_card(ui, |ui| {
-                ui.label(RichText::new("Create New File").size(13.0).color(TEXT).strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Create New").size(13.0).color(TEXT).strong());
+                    ui.add_space(8.0);
+                    ui.radio_value(&mut self.new_is_dir, false, "File");
+                    ui.radio_value(&mut self.new_is_dir, true, "Directory");
+                });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Name:").size(12.0).color(MUTED));
                     ui.add(egui::TextEdit::singleline(&mut self.new_file_name)
                         .desired_width(200.0)
-                        .hint_text("readme.md")
+                        .hint_text(if self.new_is_dir { "src" } else { "readme.md" })
                         .font(FontId::proportional(13.0)));
                 });
                 ui.add_space(4.0);
-                ui.label(RichText::new("Initial content (optional):").size(12.0).color(MUTED));
-                ui.add(egui::TextEdit::multiline(&mut self.new_file_content)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(4)
-                    .font(FontId::monospace(12.0)));
-                ui.add_space(6.0);
+                if !self.new_is_dir {
+                    ui.label(RichText::new("Initial content (optional):").size(12.0).color(MUTED));
+                    ui.add(egui::TextEdit::multiline(&mut self.new_file_content)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)
+                        .font(FontId::monospace(12.0)));
+                    ui.add_space(6.0);
+                }
                 ui.horizontal(|ui| {
                     if accent_button(ui, "Create", 70.0, false).clicked() {
                         self.create_new_file();
@@ -719,6 +741,7 @@ impl VexApp {
                     );
                     ui.painter().rect_filled(rect, Rounding::same(4.0), row_bg);
 
+                    #[allow(deprecated)]
                     let mut child = ui.child_ui(rect, Layout::left_to_right(Align::Center), None);
 
                     child.add_space(8.0);
